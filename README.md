@@ -12,6 +12,8 @@ hides its message. Do not protect anything with it.
 
 ## Try it
 
+![A recording of the demo](docs/demo.gif)
+
 ```sh
 go run ./cmd/praxis demo
 ```
@@ -87,6 +89,7 @@ up as a failed decryption. None of this is evidence of security.
 | `praxis/dec.go` | decryption and the search (Figure 10) |
 | `praxis/marshal.go` | the ciphertext as a file |
 | `cmd/praxis/` | the command-line tool |
+| `docs/demo.tape`, `docs/demo.gif` | the recording above and its script; re-record with `vhs docs/demo.tape` |
 | `curve/` | checks of the pairing library (BN254, gnark-crypto) |
 | `docs/praxis.pdf`, `docs/praxis.txt` | the paper and its text, for reference; not in git (copy the PDF there and run `pdftotext -layout`) |
 
