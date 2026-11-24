@@ -98,8 +98,8 @@ func (p Params) Validate() error {
 		return fmt.Errorf("n = (K+1)*DR must be an even divisor of q-1 from 4 to 2^20")
 	case p.K1 < 1 || p.K2 < 1 || p.K1 > n/2 || p.K2 > n/2 || p.K1*p.K2 != n/2:
 		return fmt.Errorf("K1*K2 must equal n/2 = %d", n/2)
-	case p.G < 1 || p.G > 1<<40:
-		return fmt.Errorf("G must be from 1 to 2^40")
+	case p.G < 1 || p.G > 1<<54:
+		return fmt.Errorf("G must be from 1 to 2^54")
 	case p.J < 0 || p.J > 1<<20 || p.JPrime < 0 || p.JPrime > 1<<20:
 		return fmt.Errorf("chunk counts J and JPrime must be from 0 to 2^20")
 	}

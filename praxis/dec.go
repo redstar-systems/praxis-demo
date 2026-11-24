@@ -3,6 +3,7 @@ package praxis
 import (
 	"errors"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -276,13 +277,24 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, DecReport, error) {
 		psi, err = bn254.Pair(psiP, psiQ)
 		return
 	}
-	lambda, psi, err := comb(ct.G2)
-	if err != nil {
-		return nil, rep, err
+	var lambda, psi, lambdaA, psiA bn254.GT
+	var err1, err2 error
+	var combWG sync.WaitGroup
+	combWG.Add(2)
+	go func() {
+		defer combWG.Done()
+		lambda, psi, err1 = comb(ct.G2)
+	}()
+	go func() {
+		defer combWG.Done()
+		lambdaA, psiA, err2 = comb(ct.G2a)
+	}()
+	combWG.Wait()
+	if err1 != nil {
+		return nil, rep, err1
 	}
-	lambdaA, psiA, err := comb(ct.G2a)
-	if err != nil {
-		return nil, rep, err
+	if err2 != nil {
+		return nil, rep, err2
 	}
 	rep.PairingsDur = time.Since(tPair)
 

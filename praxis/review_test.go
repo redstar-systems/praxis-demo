@@ -679,7 +679,7 @@ func TestEdgeCases(t *testing.T) {
 		{DR: 2, K: 3, K1: 3, K2: 1, G: 1},
 		{DR: 2, K: 3, K1: 2, K2: 2, G: 0},
 		{DR: 2, K: 3, K1: 2, K2: 2, G: -5},
-		{DR: 2, K: 3, K1: 2, K2: 2, G: (1 << 40) + 1},
+		{DR: 2, K: 3, K1: 2, K2: 2, G: (1 << 54) + 1},
 	} {
 		if err := badPar.Validate(); err == nil {
 			t.Fatalf("Params.Validate accepted invalid %+v", badPar)

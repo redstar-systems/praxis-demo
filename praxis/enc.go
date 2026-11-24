@@ -413,17 +413,20 @@ pick:
 		}
 		tp.Mul(&tp, &ups)
 	}
-	s2a := make([]fr.Element, len(s2))
+	s2Both := make([]fr.Element, 2*len(s2))
+	copy(s2Both, s2)
+	s2a := s2Both[len(s2):]
 	for i := range s2 {
 		s2a[i].Mul(&s2[i], &alpha)
 	}
 
 	_, _, g1, g2 := bn254.Generators()
+	g2Both := bn254.BatchScalarMultiplicationG2(&g2, s2Both)
 	ct := &Ciphertext{
 		Seed: seed,
 		G1:   bn254.BatchScalarMultiplicationG1(&g1, s1),
-		G2:   bn254.BatchScalarMultiplicationG2(&g2, s2),
-		G2a:  bn254.BatchScalarMultiplicationG2(&g2, s2a),
+		G2:   g2Both[:len(s2)],
+		G2a:  g2Both[len(s2):],
 	}
 	gt, err := bn254.Pair([]bn254.G1Affine{g1}, []bn254.G2Affine{g2})
 	if err != nil {

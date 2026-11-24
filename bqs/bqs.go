@@ -70,6 +70,28 @@ func (s *System) PadConstraints(mult int) *System {
 	return &System{N: s.N, Constraints: cons}
 }
 
+// PadUnknowns returns a copy of s with N raised to at least minN (Section 5.2),
+// allowing small circuits to satisfy Theorem 5.9's (P1) n <= D and wide-MSIS
+// ell = ceil(N / dR) > K conditions at higher lattice tiers.
+func (s *System) PadUnknowns(minN int) *System {
+	if s == nil || s.N >= minN {
+		return s
+	}
+	cons := make([]Constraint, len(s.Constraints))
+	copy(cons, s.Constraints)
+	return &System{N: minN, Constraints: cons}
+}
+
+// PadWitness zero-extends w to length targetN + 1.
+func PadWitness(w []bool, targetN int) []bool {
+	if len(w) >= targetN+1 {
+		return w
+	}
+	out := make([]bool, targetN+1)
+	copy(out, w)
+	return out
+}
+
 // Validate checks that every index is in range and every constraint has a
 // product.
 func (s *System) Validate() error {

@@ -5,10 +5,9 @@ An executable Go prototype of **Praxis**, the witness encryption scheme for NP o
 Witness encryption encrypts a message directly to a mathematical statement $S$—no secret or public key pair is ever generated. Anyone holding a witness $w$ proving $S$ is true can compute the target-group key $[\kappa]_T$ from the ciphertext and decrypt; if $S$ is false, the ciphertext hides the message. While [`psivesely/praxis-lean`](https://github.com/psivesely/praxis-lean) formalizes the scheme's correctness and generic-group extractability proofs in Lean 4, it does not generate ciphertexts or execute encryption/decryption; this repository implements the full runnable algebra of Figures 9 and 10 on BN254.
 
 > [!CAUTION]
-> **This software is an educational prototype and is NOT SECURE.**
-> - Both `Toy` ($n = 8, g = 2^{20}$) and `Advanced` ($n = 24, g = 2^{24}$) run at **interactive parameters far below cryptographic scale**: the underlying Module-SIS lattice instances have tiny rank/dimension and can be broken in milliseconds, and the 20–24-bit secret integers are trivially searchable without a witness.
-> - Nothing in this repository runs in constant time or defends against side-channel attacks, it has not undergone a cryptographic security audit, and `Params.Validate()` checks algebraic well-formedness rather than the paper's generic-group security inequalities (P1)–(P5).
-> - Passing decryption tests verify **algebraic completeness** (that every QAP, tie, and cross-term cancels as proved in Lemma 5.4 and Theorem 5.6)—they say **nothing** about whether a ciphertext hides its message. **Do not protect real data or funds with this code.**
+> **This software is an educational & research prototype and is NOT production-secure.**
+> - Default interactive tiers (`Tier 1 Toy`: $n = 8, g = 2^{20}$; `Tier 2 Advanced`: $n = 24, g = 2^{24}$) run far below cryptographic scale so operations complete in milliseconds. While the 6-tier spectrum slider (`[` / `]` or `--tier 1..6`, plus `[p]` / `--admissible`) reaches the paper's **Table 4** ring, grid, chunk, and search parameters ($n = 4{,}608, 6{,}912\text{ cells}, J = J' = 11, g \approx 2^{50.6}$) and satisfies Theorem 5.9 `(P1)` ($n \le D$) and wide Module-SIS ($\ell > K$), nothing here runs in constant time or defends against side-channel attacks, and no part of this codebase has undergone a security audit.
+> - **Do not protect real data or mainnet funds with this code.**
 
 ---
 
@@ -16,12 +15,10 @@ Witness encryption encrypts a message directly to a mathematical statement $S$�
 
 ![Interactive Praxis TUI Workbench](docs/demo.gif)
 
-The recording above is produced reproducibly from [`docs/demo.tape`](docs/demo.tape) using [Charm VHS](https://github.com/charmbracelet/vhs). It launches `praxis tui` in **Advanced mode** and walks through:
+The recording above is produced reproducibly from [`docs/demo.tape`](docs/demo.tape) using [Charm VHS](https://github.com/charmbracelet/vhs). It launches `praxis tui` and walks through:
 
-1. **Semiprime Factoring (R1CS, $F_{\max} = 1$):** Encrypts a message to $18{,}446{,}743{,}979{,}220{,}271{,}189 = p \cdot q$ ($p, q < 2^{32}$, 64 unknowns) with $J = 4, J' = 2$ chunked powers and unlocks it using the prime factors via outward $\mathbb{G}_T$ sign-class fingerprint search.
-2. **Petersen Graph 3-Colouring (Coset BQS, $F_{\max} = 3, \nu = 4$):** Encrypts to 3-colourability of the Petersen graph, unlocks the ciphertext with one colouring $w_1$, and unlocks the **exact same ciphertext** with an independent permuted colouring $w_2$ (demonstrating keyless witness-indistinguishable decryption).
-3. **3-SAT Boolean Gate Circuit:** Runs a live side-by-side **Toy vs. Advanced** benchmark on a 6-variable, 8-clause 3-SAT circuit (comparing ciphertext element counts, runtimes, and the ~20× reduction in baby-step table memory from 64-bit $\mathbb{F}_{p^6}$ sign-class fingerprints).
-4. **Operator-Free 2-of-2 Bitcoin Private Signet Taproot Vault (`signetchallenge=51`):** Locks `1.00000000 sBTC` in a 2-of-2 Tapscript output `tr(NUMS, multi_a(2, Depositor, Claimer))` (`OP_CHECKSIGADD` under BIP-341's unspendable NUMS internal key), keeping **both parties' private keys live** so nobody is asked to trust that a key file was deleted. Verifies on Bitcoin Core that neither Depositor nor Claimer can finalize a spend alone, seals Depositor's 1-of-2 partial PSBT inside a Praxis ciphertext under `bqs.BridgeBurn` (Depositor then goes offline), rejects a forged burn proof while confirming the Signet UTXO stays unspent, and finally proves a valid L2 burn preimage so Claimer decrypts Depositor's partial PSBT, co-signs the 2nd Schnorr signature, finalizes the 4-item Tapscript witness, broadcasts, and mines the settlement block on Signet.
+1. **6-Tier Parameter Spectrum Slider & `(P1)`/MSIS Admissibility (`[` / `]`, `[p]`):** Steps up from Tier 2 ($n = 24, g = 2^{24}$) to Tier 3 ($n = 96, g = 2^{32}$), toggles `[p]` (`PadUnknowns`) so both Theorem 5.9 `(P1)` ($n \le D$) and wide Module-SIS ($\ell > K$) turn green (`OK 11×13`), decrypts via Section 6.3's **6-multiplication $\mathbb{F}_p$ Chebyshev linear recurrence**, slides up to **Tier 6 (`Table 4`: $n = 4{,}608, 6{,}912\text{ cells}, g \approx 2^{50.6}$)** while cycling SilkCircuit palette variants (`[v]`), and runs a live 4-tier **Spectrum Sweep** (`[c]`, $n = 8 \to 384, \; g = 2^{20} \to 2^{40}$).
+2. **Operator-Free 2-of-2 Bitcoin Private Signet Taproot Vault (`signetchallenge=51`):** Locks `1.00000000 sBTC` in a 2-of-2 Tapscript output `tr(NUMS, multi_a(2, Depositor, Claimer))` (`OP_CHECKSIGADD` under BIP-341's unspendable NUMS internal key), keeping **both parties' private keys live** so nobody is asked to trust that a key file was deleted. Verifies on Bitcoin Core that neither Depositor nor Claimer can finalize a spend alone, seals Depositor's 1-of-2 partial PSBT inside a Praxis ciphertext under `bqs.BridgeBurn` (Depositor then goes offline), rejects a forged burn proof while confirming the Signet UTXO stays unspent, and proves a valid L2 burn preimage so Claimer decrypts Depositor's partial PSBT, co-signs the 2nd Schnorr signature, finalizes the 4-item Tapscript witness, broadcasts, and mines the settlement block on Signet.
 
 To re-record [`docs/demo.gif`](docs/demo.gif) from the repository root (requires `vhs`, `ffmpeg`, `ttyd`, and `bitcoind`):
 
@@ -37,8 +34,8 @@ Output docs/demo.gif
 
 Set Shell "bash"
 Set FontSize 16
-Set Width 1480
-Set Height 900
+Set Width 1520
+Set Height 940
 Set Padding 20
 Set Framerate 24
 Set TypingSpeed 35ms
@@ -52,46 +49,62 @@ Show
 
 Type "praxis tui"
 Enter
-Wait+Screen@10s /NP STATEMENTS/
+Wait+Screen@10s /PARAMETER SPECTRUM/
 Sleep 1.2s
 
-# 1. Semiprime Factoring (R1CS) in Advanced Mode: encrypt & unlock with (p, q).
-Type "e"
-Wait+Screen@10s /Ciphertext Sealed/
-Sleep 800ms
+# 1. Slide up to Tier 3 (n=96, g=2^32), toggle [p] so Theorem 5.9 (P1) & MSIS turn green, and decrypt.
+Type "]"
+Sleep 700ms
+Type "p"
+Sleep 1s
 Type "d"
-Wait+Screen@10s /UNLOCKED:/
+Wait+Screen@15s /UNLOCKED:/
 Sleep 1.8s
-
-# 2. Petersen Graph 3-Colouring (nu=4 cosets): unlock with w1, then alternate w2.
-Type "2"
+Type "p"
 Sleep 600ms
-Type "d"
-Wait+Screen@10s /Witness w1:/
-Sleep 1.6s
-Type "w"
-Wait+Screen@10s /Alternate w2:/
-Sleep 1.6s
 
-# 3. 3-SAT Gate Circuit: live side-by-side Toy vs Advanced benchmark.
+# 2. Slide up to Tier 6 (Table 4: n=4608, g~2^50.6), cycle SilkCircuit palettes, then sweep Tiers 1..4.
+Type "]"
+Sleep 600ms
+Type "]"
+Sleep 600ms
+Type "]"
+Sleep 1.4s
+Type "v"
+Sleep 900ms
+Type "v"
+Sleep 700ms
+Type "v"
+Sleep 700ms
+Type "v"
+Sleep 700ms
+
+Type "["
+Sleep 300ms
+Type "["
+Sleep 300ms
+Type "["
+Sleep 300ms
+Type "["
+Sleep 500ms
 Type "3"
 Sleep 600ms
 Type "c"
-Wait+Screen@15s /TOY vs ADVANCED BENCHMARK/
-Sleep 2.2s
+Wait+Screen@20s /SPECTRUM SWEEP/
+Sleep 2.5s
 
-# 4. Operator-Free 2-of-2 Bitcoin Private Signet Taproot Bridge Vault.
+# 3. Operator-Free 2-of-2 Bitcoin Private Signet Taproot Bridge Vault.
 Type "4"
-Sleep 1s
+Sleep 800ms
 Type "e"
 Wait+Screen@60s /BOTH KEYS LIVE/
-Sleep 2.2s
+Sleep 2s
 Type "x"
 Wait+Screen@15s /still UNSPENT on Signet/
-Sleep 2.5s
+Sleep 2.2s
 Type "d"
 Wait+Screen@60s /SWEPT ON SIGNET:/
-Sleep 3.5s
+Sleep 3.2s
 
 Type "q"
 Sleep 600ms
@@ -110,11 +123,31 @@ Enter
 ### Interactive Charm v2 Workbench
 
 ```sh
-go run ./cmd/praxis tui          # start in Advanced mode (press Tab to toggle Toy/Advanced)
-go run ./cmd/praxis tui --toy    # start in Toy mode
+go run ./cmd/praxis tui             # start at Tier 2 (Advanced)
+go run ./cmd/praxis tui --toy       # start at Tier 1 (Toy)
+go run ./cmd/praxis tui --tier 6    # start directly at Tier 6 (Paper Table 4: n=4608, g~2^50.6)
 ```
 
-Inside the TUI: `1`–`4` or `↑`/`↓` selects the NP statement (including `4` for the live **2-of-2 Bitcoin Private Signet Taproot Bridge Vault**), `Tab` toggles **Toy** $\leftrightarrow$ **Advanced**, `e` encrypts (or funds a fresh 2-of-2 Signet P2TR vault and seals Depositor's 1-of-2 partial PSBT), `d` decrypts with primary witness $w_1$ (and co-signs/sweeps on Signet), `w` decrypts the same ciphertext with alternate witness $w_2$, `x` flips a bit of $w_1$ and runs `DecUnchecked`, `c` benchmarks Toy vs. Advanced side by side, and `q` quits.
+Inside the TUI: `[` / `]` (or `←` / `→`) slides across all **6 parameter tiers** (`Toy` $n=8, g=2^{20}$ up to `Table-4` $n=4{,}608, g \approx 2^{50.6}$), `p` toggles `(P1)` / wide-MSIS unknown padding ($N \ge n$), `v` cycles SilkCircuit palette variants (`neon`, `vibrant`, `soft`, `glow`), `1`–`4` or `↑`/`↓` selects the NP statement (including `4` for the live **2-of-2 Bitcoin Private Signet Taproot Bridge Vault**), `e` encrypts, `d` decrypts with primary witness $w_1$, `w` decrypts with alternate witness $w_2$, `x` runs `DecUnchecked` on a 1-bit-corrupted witness, `c` sweeps Tiers 1–4 side by side, and `q` quits.
+
+### Parameter Spectrum Benchmark (`Tiers 1..6`)
+
+Benchmark encryption, decryption, and 6-mul $\mathbb{F}_p$ Chebyshev search scaling from `Toy` up to **Table 4** ($n = 4{,}608, \; 6{,}912\text{ cells}, \; g = 1{,}736{,}375{,}024{,}658{,}487 \approx 2^{50.6}$):
+
+```sh
+go run ./cmd/praxis spectrum                # Tiers 1..5 (~3s total)
+go run ./cmd/praxis spectrum --admissible   # Tiers 1..5 with N padded so (P1) n<=D and ell>K hold
+go run ./cmd/praxis spectrum --all          # Tiers 1..6 including full Table-4 (n=4608, g~2^50.6; ~17s)
+```
+
+| Tier | Name | Ring $(d_R, K)$ | Forms $n$ | Cells $3n/2$ | Chunks $(J, J')$ | Search Range $g$ ($2\log_2 g$) | 64-bit Factoring Enc / Dec (M-series Mac) |
+|---|---|---|---|---|---|---|---|
+| **T1** | `Toy` | $(2, 3)$ | $8$ | $12$ | $(1, 1)$ | $2^{20}$ (40b) | ~75 ms / ~25 ms |
+| **T2** | `Advanced` | $(4, 5)$ | $24$ | $36$ | $(4, 2)$ | $2^{24}$ (48b) | ~120 ms / ~35 ms |
+| **T3** | `Medium` | $(8, 11)$ | $96$ | $144$ | $(4, 2)$ | $2^{32}$ (64b) | ~290 ms / ~70 ms |
+| **T4** | `Heavy` | $(16, 23)$ | $384$ | $576$ | $(6, 2)$ | $2^{40}$ (80b) | ~830 ms / ~225 ms (45 ms search) |
+| **T5** | `Pre-Crypto` | $(32, 35)$ | $1{,}152$ | $1{,}728$ | $(8, 4)$ | $2^{45}$ (90b) | ~2.4 s / ~1.1 s (525 ms search) |
+| **T6** | `Table-4` | $(64, 71)$ | **$4{,}608$** | **$6{,}912$** | **$(11, 11)$** | **$1.736 \times 10^{15} \approx 2^{50.6}$ (101b)** | **~13.0 s / ~4.0 s (1.87 s search)** |
 
 ### Operator-Free 2-of-2 Bitcoin Private Signet Bridge Demo
 
@@ -193,7 +226,7 @@ The codebase implements **Figures 9 and 10** (Appendix A of ePrint 2026/2971) in
 ### What still differs from the paper (even in `Advanced` mode)
 1. **Toy/interactive parameters vs. cryptographic parameters:** Neither `Toy` ($n = 8, g = 2^{20}$) nor `Advanced` ($n = 24, g = 2^{24}$) provides Module-SIS hardness or generic-search security. Running the paper's Table 4 parameters ($n = 4{,}608, g \approx 2^{50.6}, N = 391{,}693$) requires multi-gigabyte precomputation tables (~12.35 GB for Enc, ~5.28 GB for Dec) and produces 7.88 GiB ciphertexts. Note that at tiny $N$ with $n = 24$, `Advanced` ciphertexts are **larger** than `Toy` ciphertexts because the fixed $O(n)$ tie/cross/cell bases ($16n+$ elements in $\mathbb{G}_2$) dominate when $N$ is small; chunking ($J, J' > 1$) only shrinks total size once $D$ and $\nu n_c$ exceed $\frac{3n}{2}$.
 2. **No Groth16 verifier circuit or timelock refund leaf (Section 6.1):** Statements are direct BQS encodings (`Factoring`, `Colouring`, `ThreeSAT`, `BridgeBurn`) rather than the paper's 391,693-unknown BQS encoding of a BN254 Groth16 verifier. In the Signet 2-of-2 vault demo (`tr(NUMS, multi_a(2, Depositor, Claimer))`), only the happy-path `OP_CHECKSIGADD` withdrawal leaf is constructed; a production bridge vault would add a `CSV`/`CLTV` timelock refund leaf in the Tapscript tree so funds are recoverable if the claimer never burns on L2.
-3. **Giant-step arithmetic & fingerprint table structure (Sections 5.2 & 6.3):** `searchOutwardSignFP64` steps giant candidates via full `bn254.GT` (`E12`) multiplications and verifies fingerprint hits via `GT.Exp`, using fixed 64-bit SplitMix/universal-hash constants in a Go `map`. The paper's Section 6.3 implementation instead advances traces via an XTR-like linear recurrence in $\mathbb{F}_p$ (6 $\mathbb{F}_p$ multiplications + 11 additions per candidate), uses per-run random linear forms for fingerprints, and stores a sorted flat `(uint64, uint32)` array with a directory.
+3. **6-multiplication $\mathbb{F}_p$ Chebyshev recurrence & quotiented flat table (Section 6.3):** `searchOutwardSignFP64` projects each unitary $\mathbb{G}_T$ element's shared $\mathbb{F}_{p^6}$ coordinate `V.C0` via an $\mathbb{F}_p$-linear form $\ell : \mathbb{F}_{p^6} \to \mathbb{F}_p$ and solves the $6 \times 6$ monic Chebyshev system on $2\,\text{Re}(S) \in \mathbb{F}_{p^6}$ to advance both baby and giant steps in **6 $\mathbb{F}_p$ multiplications + 11 additions per candidate** across CPU cores, indexing up to $2^{24}$ baby steps in a pointer-free 8-byte/slot quotiented open-addressed table (57-bit resolution). It uses fixed linear-form weights and deterministic shell batches rather than Section 6.3's randomized per-run linear form and sorted flat directory.
 4. **Subproduct-tree & Newton FFTs vs. binomial decomposition (Proposition 5.7 proof):** In `Advanced` mode, `Setup` builds vanishing polynomials with a binary subproduct tree of FFT multiplications ($O(D \log^2 D)$) and `Dec` divides polynomials via Hensel/Newton power-series inversion (`DivModFFT`, $O(D \log D)$), rather than decomposing prefix vanishing polynomials into $O(\log D)$ sparse binomials $X^{2^b} - c$. Likewise, `forms()` expands the ring matrix into dense vectors ($O(n N)$) rather than multiplying in $R_q$ via NTTs.
 5. **Standard point compression & in-memory serialization (Section 6.3):** `marshal.go` writes standard `gnark-crypto` compressed `G1Affine` (32 B), compressed `G2Affine` (64 B), and uncompressed `GT` (384 B) slices in memory (verifying curve and prime-order subgroup membership on read, including $z \ne 0 \land z^q = 1$ for $\mathbf{K}^\alpha \in \mathbb{G}_T$). It does not implement Koshelev's 766-bit batch compression or single-pass disk streaming.
 6. **Random-oracle domain separation & validation boundaries:**
@@ -228,7 +261,7 @@ What the test suite checks across all seven packages:
 | [`bqs/`](bqs/) | Boolean quadratic systems (`System`, `PadConstraints`), validation, and four NP encodings: `Factoring`, `Colouring`, `ThreeSAT`, and `BridgeBurn` |
 | [`signet/`](signet/) | Loopback-guarded Bitcoin Private Signet (`signetchallenge=51`) RPC client, ephemeral `bitcoind` test harness, and 2-of-2 Tapscript (`OP_CHECKSIGADD`) PSBT vault engine |
 | [`poly/`](poly/) | Schoolbook (`poly.go`) and radix-2 FFT / subproduct-tree / Hensel–Newton (`fft.go`) polynomial arithmetic over BN254's $\mathbb{F}_q$ |
-| [`praxis/params.go`](praxis/params.go) | `Params`, `Toy` & `Advanced` presets, parameter validation, and Serret extension field $\mathbb{F}_q[T]/(T^n - c_0)$ |
+| [`praxis/params.go`](praxis/params.go), [`praxis/spectrum.go`](praxis/spectrum.go) | `Params`, 6-tier `Spectrum` (`Toy` through `Table4`), Theorem 5.9 `(P1)`/MSIS `Admissibility`, and Serret extension $\mathbb{F}_q[T]/(T^n - c_0)$ |
 | [`praxis/setup.go`](praxis/setup.go) | QAP construction, natural & bit-reversed subgroup $\mathcal{H}$ placement, and FFT prefix interpolation (Definition 4.6, Lemma 4.7, Section 4.4) |
 | [`praxis/forms.go`](praxis/forms.go) | Seeded ring matrix $M \in R_q^{K \times (\ell+1)}$, linear forms, quadratic weights $U, V$, and the $K_1 \times 3K_2$ grid (Definition 5.1, Section 5.1) |
 | [`praxis/enc.go`](praxis/enc.go) | Setup layout, centered sampler $\mathcal{D}_g$, tie masks, chunked powers, and encryption (Figure 9, Proposition 5.7) |

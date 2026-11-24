@@ -4,8 +4,8 @@ Output docs/demo.gif
 
 Set Shell "bash"
 Set FontSize 16
-Set Width 1480
-Set Height 900
+Set Width 1520
+Set Height 940
 Set Padding 20
 Set Framerate 24
 Set TypingSpeed 35ms
@@ -20,49 +20,63 @@ Show
 
 Type "praxis tui"
 Enter
-Wait+Screen@10s /NP STATEMENTS/
+Wait+Screen@10s /PARAMETER SPECTRUM/
 Sleep 1.2s
 
-# 1. Semiprime Factoring (R1CS) in Advanced Mode: encrypt & unlock with (p, q).
-Type "e"
-Wait+Screen@10s /Ciphertext Sealed/
-Sleep 800ms
+# 1. Slide up to Tier 3 (n=96, g=2^32), toggle [p] so Theorem 5.9 (P1) & MSIS turn green, and decrypt!
+Type "]"
+Sleep 700ms
+Type "p"
+Sleep 1s
 Type "d"
-Wait+Screen@10s /UNLOCKED:/
+Wait+Screen@15s /UNLOCKED:/
 Sleep 1.8s
-
-# 2. Petersen Graph 3-Colouring (nu=4 cosets): unlock with w1, then alternate w2.
-Type "2"
+Type "p"
 Sleep 600ms
-Type "d"
-Wait+Screen@10s /Witness w1:/
-Sleep 1.6s
-Type "w"
-Wait+Screen@10s /Alternate w2:/
-Sleep 1.6s
 
-# 3. 3-SAT Gate Circuit: live side-by-side Toy vs Advanced benchmark.
+# 2. Slide up to Tier 4 (n=384, g=2^40) -> Tier 6 (Table 4: n=4608, g~2^50.6), preview & cycle palette, then sweep Tiers 1..4!
+Type "]"
+Sleep 600ms
+Type "]"
+Sleep 600ms
+Type "]"
+Sleep 1.4s
+Type "v"
+Sleep 900ms
+Type "v"
+Sleep 700ms
+Type "v"
+Sleep 700ms
+Type "v"
+Sleep 700ms
+
+# Step back to Tier 2, select 3-SAT, and run 4-tier Spectrum Sweep [c] (n=8 -> 384, g=2^20 -> 2^40).
+Type "["
+Sleep 300ms
+Type "["
+Sleep 300ms
+Type "["
+Sleep 300ms
+Type "["
+Sleep 500ms
 Type "3"
 Sleep 600ms
 Type "c"
-Wait+Screen@15s /TOY vs ADVANCED BENCHMARK/
-Sleep 2.2s
+Wait+Screen@20s /SPECTRUM SWEEP/
+Sleep 2.5s
 
-# 4. Operator-Free 2-of-2 Bitcoin Private Signet Taproot Bridge Vault:
-#    [e] Fund 2-of-2 tr(NUMS, multi_a(2, Dep, Clm)) vault (both keys LIVE), seal 1/2 PSBT
-#    [x] Attack with forged burn proof (QAP fails, 2-of-2 Signet UTXO verified unspent)
-#    [d] Prove valid L2 burn -> decrypt 1/2 PSBT -> Claimer co-sign & mine on Signet
+# 3. Operator-Free 2-of-2 Bitcoin Private Signet Taproot Bridge Vault.
 Type "4"
-Sleep 1s
+Sleep 800ms
 Type "e"
 Wait+Screen@60s /BOTH KEYS LIVE/
-Sleep 2.2s
+Sleep 2s
 Type "x"
 Wait+Screen@15s /still UNSPENT on Signet/
-Sleep 2.5s
+Sleep 2.2s
 Type "d"
 Wait+Screen@60s /SWEPT ON SIGNET:/
-Sleep 3.5s
+Sleep 3.2s
 
 Type "q"
 Sleep 600ms

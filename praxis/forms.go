@@ -3,6 +3,8 @@ package praxis
 import (
 	"crypto/sha512"
 	"encoding/binary"
+	"runtime"
+	"sync"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
@@ -21,7 +23,7 @@ func (par Params) forms(seed []byte, N int) [][]fr.Element {
 		phi[e] = make([]fr.Element, N+1)
 	}
 	phi[0][0].SetOne()
-	for i := 1; i <= par.K; i++ {
+	fillRow := func(i int) {
 		for j := 0; j <= ell; j++ {
 			m := ringElement(seed, i, j, dr)
 			if j == 0 {
@@ -47,6 +49,29 @@ func (par Params) forms(seed []byte, N int) [][]fr.Element {
 			}
 		}
 	}
+	if par.K < 8 {
+		for i := 1; i <= par.K; i++ {
+			fillRow(i)
+		}
+		return phi
+	}
+	workers := min(runtime.NumCPU(), par.K)
+	var wg sync.WaitGroup
+	rowCh := make(chan int, par.K)
+	for i := 1; i <= par.K; i++ {
+		rowCh <- i
+	}
+	close(rowCh)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range rowCh {
+				fillRow(i)
+			}
+		}()
+	}
+	wg.Wait()
 	return phi
 }
 
@@ -132,8 +157,12 @@ func (par Params) weightsOf(f field, phi [][]fr.Element, w []bool) weights {
 		zCirc:  z.Substitute(&minus),
 		zPlus:  z.Substitute(&cPlus),
 	}
-	wt.U = f.reduce(poly.Mul(z, wt.zMinus))
-	wt.V = f.reduce(poly.Mul(z, wt.zCirc))
+	mul := poly.Mul
+	if par.Fast {
+		mul = poly.MulFFT
+	}
+	wt.U = f.reduce(mul(z, wt.zMinus))
+	wt.V = f.reduce(mul(z, wt.zCirc))
 	return wt
 }
 
