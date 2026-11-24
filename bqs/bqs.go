@@ -55,9 +55,30 @@ func (s *System) Fmax() int {
 	return m
 }
 
+// PadConstraints returns a copy of s padded with 0 = 0 constraints (Section 4.1
+// and Section 5.2) so that len(Constraints) is a multiple of mult.
+func (s *System) PadConstraints(mult int) *System {
+	if s == nil || mult <= 1 || len(s.Constraints)%mult == 0 {
+		return s
+	}
+	rem := mult - (len(s.Constraints) % mult)
+	cons := make([]Constraint, len(s.Constraints), len(s.Constraints)+rem)
+	copy(cons, s.Constraints)
+	for i := 0; i < rem; i++ {
+		cons = append(cons, Constraint{Products: []Product{{}}})
+	}
+	return &System{N: s.N, Constraints: cons}
+}
+
 // Validate checks that every index is in range and every constraint has a
 // product.
 func (s *System) Validate() error {
+	if s == nil {
+		return fmt.Errorf("nil system")
+	}
+	if s.N < 0 {
+		return fmt.Errorf("negative unknown count %d", s.N)
+	}
 	check := func(v Vec) error {
 		for _, t := range v {
 			if t.I < 0 || t.I > s.N {
@@ -102,7 +123,7 @@ func (v Vec) Apply(w []bool) fr.Element {
 // IsWitness reports whether w solves the system. w has N+1 entries and w[0]
 // must be true.
 func (s *System) IsWitness(w []bool) bool {
-	if len(w) != s.N+1 || !w[0] {
+	if s == nil || s.N < 0 || len(w) != s.N+1 || !w[0] {
 		return false
 	}
 	var sum, t fr.Element

@@ -14,8 +14,17 @@ hides its message. Do not protect anything with it.
 
 ![A recording of the demo](docs/demo.gif)
 
+Open the interactive Charm v2 workbench (supports switching live between **Toy** and **Advanced** modes across Factoring, Petersen 3-Colouring, and 3-SAT):
+
+```sh
+go run ./cmd/praxis tui
+```
+
+Or run the CLI walkthrough in either Toy or Advanced mode:
+
 ```sh
 go run ./cmd/praxis demo
+go run ./cmd/praxis demo --advanced
 ```
 
 encrypts a message to two puzzles and decrypts each with its solution. To
@@ -26,40 +35,24 @@ go run ./cmd/praxis encrypt factor 3214085717 16 "hello" hello.ct
 go run ./cmd/praxis decrypt hello.ct 64283 49999
 ```
 
-or to a graph, so that whoever can colour it can:
+or to a graph (pass `--advanced` to enable multi-chunk powers, FFT QAP, and sign-class fingerprint search), so that whoever can colour it can:
 
 ```sh
-go run ./cmd/praxis encrypt colour 0-1,1-2,2-0 3 "hello" hello.ct
+go run ./cmd/praxis encrypt --advanced colour 0-1,1-2,2-0 3 "hello" hello.ct
 go run ./cmd/praxis decrypt hello.ct 0,1,2
 ```
 
-The 32-bit factoring demo makes a ciphertext of 129 KB and takes about 60 ms
-each way.
-
 ## What is here
 
-The whole scheme as the paper specifies it in Figures 9 and 10: the
-polynomial encoding of a system with a coset per equation, the forms from a
-seeded ring matrix, the weights from an extension field, the grid of copies
-with shared factors, the tie masks and their cancellation, the centered
-sampler, and the search. Statements are systems of quadratic equations in
-unknowns that must each be 0 or 1 (the paper's sections 4 and 5).
+The whole scheme as the paper specifies it in Figures 9 and 10, in two selectable modes:
 
-What differs from the paper:
+- **Toy mode (`praxis.Toy`):** Eight forms ($n = 8$) and twelve cells ($2 \times 6$ grid), 20-bit secrets, unsplit power lists ($J = J' = 1$), schoolbook QAP interpolation, and growing-interval BSGS.
+- **Advanced mode (`praxis.Advanced`):** General even Serret extensions $n = (K+1)d_R \mid (q - 1)$ ($n = 24$ forms, 36 cells in a $4 \times 9$ grid), 24-bit secrets, multi-chunk quotient and remainder powers ($J = 4, J' = 2$, Section 5.2), bit-reversed subgroup placement in $\mathcal{H}$ with $O(|\mathcal{H}| \log |\mathcal{H}|)$ radix-2 FFT / Hensel–Newton polynomial division (Section 4.4), and outward search on $\mathbb{G}_T$ sign classes $\{V, V^{-1}\}$ using 64-bit $\mathbb{F}_{p^6}$ fingerprints (Section 5.2).
 
-- **Parameters.** Eight forms and twelve copies where the paper has 4,608
-  and 6,912; secret integers of 20 bits where the paper has about 50. The
-  lattice problem behind the forms is trivial at this size.
-- **One chunk of powers.** The paper splits two lists of powers into chunks
-  to save 2 percent of size; this takes the unsplit case, which the paper
-  also defines.
-- **Slow polynomial arithmetic.** Quadratic time, no fast transforms. Fine
-  to a few thousand evaluation points.
-- **A plain search.** Baby steps and giant steps over the whole range, not
-  the paper's outward search with fingerprints.
-- **Not the paper's instantiation** (section 6), which encrypts to a Groth16
-  verifier of 391,693 unknowns and makes every ciphertext 7.88 GiB. This
-  encrypts to small systems written by hand.
+What still differs from the paper's full 100-bit instantiation:
+
+- **Interactive parameter scale.** Eight to twenty-four forms and 20–24-bit secrets instead of 4,608 forms, 6,912 copies, and ~50-bit secrets, so encryption and decryption run in ~50–120 ms locally without 12 GB precomputation tables.
+- **Not constant-time, and hand-built BQS statements** (factoring, graph colouring, and 3-SAT gate reductions) rather than Section 6's 391,693-unknown Groth16 verifier (7.88 GiB ciphertexts).
 
 ## What the tests show
 
@@ -81,14 +74,15 @@ up as a failed decryption. None of this is evidence of security.
 
 | path | what |
 |---|---|
-| `bqs/` | systems of equations, and the two puzzles: factoring and graph colouring |
-| `poly/` | polynomial arithmetic over the curve's scalar field |
-| `praxis/setup.go` | the polynomial encoding of a system (Definition 4.6, Lemma 4.7) |
-| `praxis/forms.go` | forms, weights and the grid of copies (Definition 5.1, section 5.1) |
-| `praxis/enc.go` | encryption (Figure 9) |
-| `praxis/dec.go` | decryption and the search (Figure 10) |
-| `praxis/marshal.go` | the ciphertext as a file |
-| `cmd/praxis/` | the command-line tool |
+| `bqs/` | Boolean quadratic systems, padding, and three puzzles: factoring, graph colouring, and 3-SAT |
+| `poly/` | schoolbook and radix-2 FFT / Hensel–Newton polynomial arithmetic over BN254's scalar field |
+| `praxis/setup.go` | QAP encoding and bit-reversed subgroup $\mathcal{H}$ placement (Definition 4.6, Lemma 4.7, Section 4.4) |
+| `praxis/forms.go` | forms, extension-field weights, and the grid of copies (Definition 5.1, Section 5.1) |
+| `praxis/enc.go` | encryption with optional multi-chunk powers (Figure 9, Section 5.2) |
+| `praxis/dec.go`, `praxis/search_fast.go` | decryption, growing-interval BSGS, and outward $\mathbb{G}_T$ sign-class 64-bit fingerprint search (Figure 10, Section 5.2) |
+| `praxis/marshal.go` | compressed ciphertext serialization with curve and $\mathbb{G}_T$ subgroup checks |
+| `tui/` | interactive Charm v2 workbench comparing Toy and Advanced modes |
+| `cmd/praxis/` | the command-line tool (`tui`, `demo`, `encrypt`, `decrypt`) |
 | `docs/demo.tape`, `docs/demo.gif` | the recording above and its script; re-record with `vhs docs/demo.tape` |
 | `curve/` | checks of the pairing library (BN254, gnark-crypto) |
 | `docs/praxis.pdf`, `docs/praxis.txt` | the paper and its text, for reference; not in git (copy the PDF there and run `pdftotext -layout`) |

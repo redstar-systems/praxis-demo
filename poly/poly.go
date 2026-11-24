@@ -20,7 +20,7 @@ func (p Poly) Trim() Poly {
 
 // Coeff returns the coefficient of X^k, zero past the end.
 func (p Poly) Coeff(k int) fr.Element {
-	if k < len(p) {
+	if k >= 0 && k < len(p) {
 		return p[k]
 	}
 	return fr.Element{}

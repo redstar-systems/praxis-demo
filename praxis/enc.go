@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -25,15 +26,26 @@ type Ciphertext struct {
 
 // layout gives the position of each named element in the flat lists.
 type layout struct {
-	par          Params
-	n1, d, nu, n int // N+1, D, coset size, forms
-	remIdx       []int
-	nRem         int
+	par               Params
+	n1, nu, n         int // N+1, coset size, forms
+	delta, deltaPrime int // chunk lengths Delta and Delta'
+	jQuo, jRem        int // chunk counts J and J'
+	remIdx            []int
+	nRem              int
 }
 
 func (pp *Public) layout() layout {
-	l := layout{par: pp.Par, n1: pp.S.N + 1, d: pp.D, nu: pp.Nu, n: pp.Par.NForms()}
-	l.remIdx = make([]int, pp.cosetLen())
+	l := layout{
+		par:        pp.Par,
+		n1:         pp.S.N + 1,
+		nu:         pp.Nu,
+		n:          pp.Par.NForms(),
+		delta:      pp.Delta,
+		deltaPrime: pp.DeltaPrime,
+		jQuo:       pp.Par.JQuo(),
+		jRem:       pp.Par.JRem(),
+	}
+	l.remIdx = make([]int, pp.DeltaPrime)
 	for k := range l.remIdx {
 		if k%pp.Nu == 0 {
 			l.remIdx[k] = -1
@@ -49,18 +61,19 @@ func (pp *Public) layout() layout {
 func (l layout) f(k1, i, coord int) int { return (k1*l.n1+i)*2 + coord }
 func (l layout) y(i int) int            { return 2*l.par.K1*l.n1 + i }
 func (l layout) pquo(k int) int         { return (2*l.par.K1+1)*l.n1 + k }
-func (l layout) prem(k int) int         { return (2*l.par.K1+1)*l.n1 + l.d + l.remIdx[k] }
-func (l layout) lenG1() int             { return (2*l.par.K1+1)*l.n1 + l.d + l.nRem }
+func (l layout) premBase() int          { return (2*l.par.K1+1)*l.n1 + l.delta }
+func (l layout) prem(k int) int         { return l.premBase() + l.remIdx[k] }
+func (l layout) lenG1() int             { return l.premBase() + l.nRem }
 
-// G2: right factors, search bases, quotient and remainder bases, tie bases,
-// cross bases.
+// G2: right factors, search bases, quotient and remainder bases (chunked), tie
+// bases, cross bases.
 func (l layout) h(leg, j, coord int) int { return (leg*l.n1+j)*2 + coord }
 func (l layout) s(leg int) int           { return 2*l.par.legs()*l.n1 + leg }
-func (l layout) bquo(cell int) int       { return l.s(l.par.legs()) + cell }
-func (l layout) brem(cell int) int       { return l.bquo(l.par.Cells()) + cell }
+func (l layout) bquo(cell, j int) int    { return l.s(l.par.legs()) + j*l.par.Cells() + cell }
+func (l layout) brem(cell, j int) int    { return l.bquo(0, l.jQuo) + j*l.par.Cells() + cell }
 
 // tie(a, e) for a in 0..2 and e in 0..n-2.
-func (l layout) tie(a, e int) int { return l.brem(l.par.Cells()) + a*(l.n-1) + e }
+func (l layout) tie(a, e int) int { return l.brem(0, l.jRem) + a*(l.n-1) + e }
 
 // The five cross families, (a, iota) with iota = +1 or -1; (1, -1) does not
 // occur.
@@ -90,26 +103,34 @@ func randNonzero() fr.Element {
 }
 
 // randRange returns a uniform integer in {2, ..., g+1}.
-func randRange(g int64) int64 {
-	v, err := rand.Int(rand.Reader, big.NewInt(g))
+func randRange(bigG *big.Int) int64 {
+	v, err := rand.Int(rand.Reader, bigG)
 	if err != nil {
 		panic(err)
 	}
 	return v.Int64() + 2
 }
 
-// sampleR is the centered sampler of Definition 5.3, also returned as field
-// elements. r[0] can be negative.
+// sampleR is the centered sampler of Definition 5.3, returned as field
+// elements.
 func sampleR(N int, g int64) []fr.Element {
 	r := make([]fr.Element, N+1)
-	var sum int64
+	bigG := big.NewInt(g)
+	sum := new(big.Int)
+	var tmp big.Int
 	for i := 1; i <= N; i++ {
-		v := randRange(g)
-		sum += v
+		v := randRange(bigG)
+		sum.Add(sum, tmp.SetInt64(v))
 		r[i].SetInt64(v)
 	}
-	r0 := (int64(N)*(g+1)+1)/2 + randRange(g) - sum/2
-	r[0].SetInt64(r0)
+	// r0 = ceil(N*(g+1)/2) + r* - floor(sum/2)
+	a := new(big.Int).Mul(big.NewInt(int64(N)), big.NewInt(g+1))
+	a.Add(a, big.NewInt(1))
+	a.Rsh(a, 1)
+	halfSum := sum.Rsh(sum, 1)
+	r0 := a.Add(a, tmp.SetInt64(randRange(bigG)))
+	r0.Sub(r0, halfSum)
+	r[0].SetBigInt(r0)
 	return r
 }
 
@@ -139,13 +160,23 @@ func xor(a, b []byte) []byte {
 
 // Enc encrypts msg to the system: any solution of the system decrypts.
 func Enc(pp *Public, msg []byte) (*Ciphertext, error) {
+	ct, _, err := EncDetailed(pp, msg)
+	return ct, err
+}
+
+// EncDetailed encrypts msg to the system and returns telemetry alongside the ciphertext.
+func EncDetailed(pp *Public, msg []byte) (*Ciphertext, EncReport, error) {
+	if pp == nil {
+		return nil, EncReport{}, fmt.Errorf("nil public parameters")
+	}
+	start := time.Now()
 	par, N, f := pp.Par, pp.S.N, pp.fld
 	n := par.NForms()
 	l := pp.layout()
 
 	seed := make([]byte, 32)
 	if _, err := rand.Read(seed); err != nil {
-		return nil, err
+		return nil, EncReport{}, err
 	}
 	phi := par.forms(seed, N)
 
@@ -154,17 +185,21 @@ func Enc(pp *Public, msg []byte) (*Ciphertext, error) {
 	y := make([]fr.Element, N+1)
 	for i := range y {
 		if _, err := y[i].SetRandom(); err != nil {
-			return nil, err
+			return nil, EncReport{}, err
 		}
 	}
 	var tau, zpTau, omega12 fr.Element
 	for {
-		tau.SetRandom()
+		if _, err := tau.SetRandom(); err != nil {
+			return nil, EncReport{}, err
+		}
 		if zpTau = pp.ZP.Eval(&tau); !zpTau.IsZero() {
 			break
 		}
 	}
-	omega12.SetRandom()
+	if _, err := omega12.SetRandom(); err != nil {
+		return nil, EncReport{}, err
+	}
 	omega22, alpha, pi := randNonzero(), randNonzero(), randNonzero()
 	sKind := [3]fr.Element{randNonzero(), randNonzero(), randNonzero()}
 	ups := randNonzero()
@@ -287,11 +322,11 @@ pick:
 	}
 	var tp fr.Element
 	tp.SetOne()
-	for k := 0; k < max(pp.D, pp.cosetLen()); k++ {
-		if k < pp.D {
+	for k := 0; k < max(pp.Delta, pp.DeltaPrime); k++ {
+		if k < pp.Delta {
 			s1[l.pquo(k)].Mul(&zeta, &tp)
 		}
-		if k < pp.cosetLen() && k%pp.Nu != 0 {
+		if k < pp.DeltaPrime && k%pp.Nu != 0 {
 			s1[l.prem(k)].Mul(&zeta1, &tp)
 		}
 		tp.Mul(&tp, &tau)
@@ -323,6 +358,8 @@ pick:
 	zeta2Inv.Inverse(&zeta2)
 	zKey.Sub(&tau, &pp.Points[pp.rhoIndex()])
 	zKey.Mul(&zKey, &zTau) // Z(tau) * (tau - rho), for the key copy
+	tauDelta := pow(&tau, pp.Delta)
+	tauDeltaP := pow(&tau, pp.DeltaPrime)
 	for k1 := 0; k1 < par.K1; k1++ {
 		for leg := 0; leg < par.legs(); leg++ {
 			c := par.cell(k1, leg)
@@ -332,10 +369,20 @@ pick:
 			if c == 0 {
 				zc = zKey
 			}
-			s2[l.bquo(c)].Mul(&gamma, &zc)
-			s2[l.bquo(c)].Mul(&s2[l.bquo(c)], &zetaInv)
-			s2[l.brem(c)].Mul(&gamma, &z0Tau)
-			s2[l.brem(c)].Mul(&s2[l.brem(c)], &zeta1Inv)
+			var curQuo fr.Element
+			curQuo.Mul(&gamma, &zc)
+			curQuo.Mul(&curQuo, &zetaInv)
+			for j := 0; j < l.jQuo; j++ {
+				s2[l.bquo(c, j)] = curQuo
+				curQuo.Mul(&curQuo, &tauDelta)
+			}
+			var curRem fr.Element
+			curRem.Mul(&gamma, &z0Tau)
+			curRem.Mul(&curRem, &zeta1Inv)
+			for j := 0; j < l.jRem; j++ {
+				s2[l.brem(c, j)] = curRem
+				curRem.Mul(&curRem, &tauDeltaP)
+			}
 		}
 	}
 	// Tie bases carry P(upsilon) = upsilon^n - c0; cross bases carry eps or
@@ -380,7 +427,7 @@ pick:
 	}
 	gt, err := bn254.Pair([]bn254.G1Affine{g1}, []bn254.G2Affine{g2})
 	if err != nil {
-		return nil, err
+		return nil, EncReport{}, err
 	}
 	var key bn254.GT
 	key.Exp(gt, kappa.BigInt(new(big.Int)))
@@ -388,7 +435,20 @@ pick:
 	ak.Mul(&alpha, &kappa)
 	ct.Ka.Exp(gt, ak.BigInt(new(big.Int)))
 	ct.Msg = xor(msg, keyPad(&key, len(msg)))
-	return ct, nil
+	g1Count, g2Count := pp.Counts()
+	rep := EncReport{
+		EncDur: time.Since(start),
+		G1:     g1Count,
+		G2:     g2Count,
+		Bytes:  ct.Size(),
+		J:      l.jQuo,
+		Delta:  pp.Delta,
+		JPrime: l.jRem,
+		DeltaP: pp.DeltaPrime,
+		Forms:  n,
+		Cells:  par.Cells(),
+	}
+	return ct, rep, nil
 }
 
 // Counts returns the number of elements of G1 and of G2 in a ciphertext of
@@ -398,13 +458,13 @@ func (pp *Public) Counts() (g1, g2 int) {
 	return l.lenG1(), 2 * l.lenG2()
 }
 
-// PaperCounts is the same count from the formulas of Proposition 5.7 with
-// one chunk of powers.
+// PaperCounts is the same count from the formulas of Proposition 5.7.
 func (pp *Public) PaperCounts() (g1, g2 int) {
 	par, n := pp.Par, pp.Par.NForms()
+	jQuo, jRem := par.JQuo(), par.JRem()
 	N, nc := pp.S.N, pp.nc()
-	n1 := (2*par.K1+1)*(N+1) + pp.D + (pp.Nu-1)*nc
-	n2 := 6*par.K2*(N+1) + 3*par.K2 + 3*n/2*2 + 13*n - 8
+	n1 := (2*par.K1+1)*(N+1) + pp.Delta + (pp.Nu-1)*nc/jRem
+	n2 := 6*par.K2*(N+1) + 3*par.K2 + 3*n/2*(jQuo+jRem) + 13*n - 8
 	return n1, 2 * n2
 }
 
@@ -416,6 +476,9 @@ func (ct *Ciphertext) Size() int {
 }
 
 func (ct *Ciphertext) check(pp *Public) error {
+	if ct == nil {
+		return fmt.Errorf("nil ciphertext")
+	}
 	l := pp.layout()
 	if len(ct.G1) != l.lenG1() || len(ct.G2) != l.lenG2() || len(ct.G2a) != l.lenG2() {
 		return fmt.Errorf("ciphertext does not match the system's shape")

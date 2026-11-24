@@ -3,6 +3,7 @@ package praxis
 import (
 	"errors"
 	"math/big"
+	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
@@ -22,8 +23,14 @@ var (
 // Dec decrypts with a solution w of the system (w[0] true, then the N
 // unknowns).
 func Dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
-	if !pp.S.IsWitness(w) {
-		return nil, ErrNotWitness
+	msg, _, err := DecDetailed(pp, ct, w)
+	return msg, err
+}
+
+// DecDetailed decrypts with a solution w and returns telemetry alongside the message.
+func DecDetailed(pp *Public, ct *Ciphertext, w []bool) ([]byte, DecReport, error) {
+	if pp == nil || !pp.S.IsWitness(w) {
+		return nil, DecReport{}, ErrNotWitness
 	}
 	return dec(pp, ct, w)
 }
@@ -33,8 +40,14 @@ func Dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 // assignment gets nothing: the divisions are no longer exact, their
 // remainders are dropped, and what comes out is ErrFailed or noise.
 func DecUnchecked(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
-	if len(w) != pp.S.N+1 || !w[0] {
-		return nil, ErrNotWitness
+	msg, _, err := DecUncheckedDetailed(pp, ct, w)
+	return msg, err
+}
+
+// DecUncheckedDetailed runs DecUnchecked and returns telemetry alongside any output.
+func DecUncheckedDetailed(pp *Public, ct *Ciphertext, w []bool) ([]byte, DecReport, error) {
+	if pp == nil || len(w) != pp.S.N+1 || !w[0] {
+		return nil, DecReport{}, ErrNotWitness
 	}
 	return dec(pp, ct, w)
 }
@@ -68,20 +81,34 @@ func pad(p poly.Poly, n int) []fr.Element {
 	return out
 }
 
-func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
+// chunkCoeffs returns p's coefficients from X^start to X^(start+length-1).
+func chunkCoeffs(p poly.Poly, start, length int) []fr.Element {
+	out := make([]fr.Element, length)
+	if start < len(p) {
+		copy(out, p[start:])
+	}
+	return out
+}
+
+func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, DecReport, error) {
+	var rep DecReport
+	totalStart := time.Now()
 	if err := ct.check(pp); err != nil {
-		return nil, err
+		return nil, rep, err
 	}
 	par, N, f := pp.Par, pp.S.N, pp.fld
 	n := par.NForms()
 	l := pp.layout()
+	rep.Pairings = 18*par.K2 + 4*l.jQuo + 2*l.jRem + 2
 
 	// Lines 1 and 2: the forms and the weights at w.
+	t0 := time.Now()
 	phi := par.forms(ct.Seed, N)
 	wt := par.weightsOf(f, phi, w)
 	xiKey := par.xi(&wt, 0, 0)
 	if xiKey.IsZero() {
-		return nil, ErrFailed
+		rep.TotalDur = time.Since(totalStart)
+		return nil, rep, ErrFailed
 	}
 	xi := make([]fr.Element, par.Cells())
 	for k1 := 0; k1 < par.K1; k1++ {
@@ -89,9 +116,12 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 			xi[par.cell(k1, leg)] = par.xi(&wt, k1, leg)
 		}
 	}
+	rep.FormsDur = time.Since(t0)
 
 	// Line 3: the quotients and the remainder.
-	hKey, hOth, rem, _ := pp.quotients(w)
+	tQAP := time.Now()
+	hKey, hOth, rem, exact := pp.quotients(w)
+	rep.ExactQAP = exact
 
 	// Line 4: the cancellation polynomials (Equation (6)). U1 and V1 scale
 	// each cell's term by omega^(2*k1); U2 scales it by (-omega)^kleg; Urot
@@ -109,25 +139,33 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 	}
 	uRot := wt.U.Substitute(&negOmega)
 	modulus := f.modulus()
+	mulPoly := poly.Mul
+	divPoly := poly.DivMod
+	if par.Fast {
+		mulPoly = poly.MulFFT
+		divPoly = poly.DivModFFT
+	}
 	tieQuot := func(a, b poly.Poly) poly.Poly {
-		q, _ := poly.DivMod(poly.Sub(a, b), modulus)
+		q, _ := divPoly(poly.Sub(a, b), modulus)
 		return q
 	}
 	neg := func(p poly.Poly) poly.Poly { return poly.Sub(nil, p) }
 	x0 := [3]poly.Poly{
-		tieQuot(poly.Mul(wt.U, wt.zCirc), poly.Mul(wt.V, wt.zMinus)),
-		tieQuot(poly.Mul(wt.U, wt.zPlus), poly.Mul(uRot, wt.zMinus)),
-		tieQuot(poly.Mul(wt.V, wt.zPlus), poly.Mul(uRot, wt.zCirc)),
+		tieQuot(mulPoly(wt.U, wt.zCirc), mulPoly(wt.V, wt.zMinus)),
+		tieQuot(mulPoly(wt.U, wt.zPlus), mulPoly(uRot, wt.zMinus)),
+		tieQuot(mulPoly(wt.V, wt.zPlus), mulPoly(uRot, wt.zCirc)),
 	}
 	var xc [crossFamilies]poly.Poly
-	xc[cross1Plus] = poly.Sub(poly.Mul(u1, wt.zCirc), poly.Mul(v1, wt.zMinus))
-	xc[cross2Plus] = poly.Mul(u1, wt.zPlus)
-	xc[cross2Minus] = neg(poly.Mul(u2, wt.zMinus))
-	xc[cross3Plus] = poly.Mul(v1, wt.zPlus)
-	xc[cross3Minus] = neg(poly.Mul(u2, wt.zCirc))
+	xc[cross1Plus] = poly.Sub(mulPoly(u1, wt.zCirc), mulPoly(v1, wt.zMinus))
+	xc[cross2Plus] = mulPoly(u1, wt.zPlus)
+	xc[cross2Minus] = neg(mulPoly(u2, wt.zMinus))
+	xc[cross3Plus] = mulPoly(v1, wt.zPlus)
+	xc[cross3Minus] = neg(mulPoly(u2, wt.zCirc))
+	rep.QAPDur = time.Since(tQAP)
 
 	// Line 5: sums of left factors over the ones of w, then over each
 	// column of the grid with the cells' weights.
+	tPair := time.Now()
 	fw := make([][2]bn254.G1Jac, par.K1)
 	var yw bn254.G1Jac
 	for i, on := range w {
@@ -155,19 +193,27 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 		fLeg[leg][1] = msm1(fwAff[1], col)
 	}
 
-	// Line 6: the quotients and the remainder in the exponent.
-	pquo := ct.G1[l.pquo(0):l.pquo(pp.D)]
-	pKey := msm1(pquo, pad(hKey, pp.D))
-	pOth := msm1(pquo, pad(hOth, pp.D))
-	var remPts []bn254.G1Affine
-	var remSc []fr.Element
-	for k := 0; k < pp.cosetLen(); k++ {
-		if k%pp.Nu != 0 {
-			remPts = append(remPts, ct.G1[l.prem(k)])
-			remSc = append(remSc, rem.Coeff(k))
-		}
+	// Line 6: the quotients and the remainder in the exponent (across J and J' chunks).
+	pquo := ct.G1[l.pquo(0) : l.pquo(0)+pp.Delta]
+	pKey := make([]bn254.G1Affine, l.jQuo)
+	pOth := make([]bn254.G1Affine, l.jQuo)
+	for j := 0; j < l.jQuo; j++ {
+		pKey[j] = msm1(pquo, chunkCoeffs(hKey, j*pp.Delta, pp.Delta))
+		pOth[j] = msm1(pquo, chunkCoeffs(hOth, j*pp.Delta, pp.Delta))
 	}
-	pRem := msm1(remPts, remSc)
+	remPts := ct.G1[l.premBase() : l.premBase()+l.nRem]
+	pRem := make([]bn254.G1Affine, l.jRem)
+	remSc := make([]fr.Element, 0, l.nRem)
+	for j := 0; j < l.jRem; j++ {
+		remSc = remSc[:0]
+		baseExp := j * pp.DeltaPrime
+		for k := 0; k < pp.DeltaPrime; k++ {
+			if k%pp.Nu != 0 {
+				remSc = append(remSc, rem.Coeff(baseExp+k))
+			}
+		}
+		pRem[j] = msm1(remPts, remSc)
+	}
 	var ywAff bn254.G1Affine
 	ywAff.FromJacobian(&yw)
 
@@ -204,9 +250,13 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 			qs = append(qs, q)
 		}
 		cells := par.Cells()
-		sub(pKey, msm2(g2[l.bquo(0):l.bquo(1)], xiKeyOnly))
-		sub(pOth, msm2(g2[l.bquo(0):l.bquo(cells)], xiOth))
-		sub(pRem, msm2(g2[l.brem(0):l.brem(cells)], xi))
+		for j := 0; j < l.jQuo; j++ {
+			sub(pKey[j], msm2(g2[l.bquo(0, j):l.bquo(1, j)], xiKeyOnly))
+			sub(pOth[j], msm2(g2[l.bquo(0, j):l.bquo(cells, j)], xiOth))
+		}
+		for j := 0; j < l.jRem; j++ {
+			sub(pRem[j], msm2(g2[l.brem(0, j):l.brem(cells, j)], xi))
+		}
 
 		var bPts []bn254.G2Affine
 		var bSc []fr.Element
@@ -228,16 +278,18 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 	}
 	lambda, psi, err := comb(ct.G2)
 	if err != nil {
-		return nil, err
+		return nil, rep, err
 	}
 	lambdaA, psiA, err := comb(ct.G2a)
 	if err != nil {
-		return nil, err
+		return nil, rep, err
 	}
+	rep.PairingsDur = time.Since(tPair)
 
 	// Lines 8 to 10: remove the key and the center from the alpha side, and
 	// search for what is left of the secret sum.
-	cw := center(N, par.G, w)
+	tSearch := time.Now()
+	cw := centerBig(N, par.G, w)
 	q := fr.Modulus()
 	gtExp := func(x *bn254.GT, k *big.Int) bn254.GT {
 		var out bn254.GT
@@ -246,76 +298,168 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, error) {
 	}
 	xiKeyInt := xiKey.BigInt(new(big.Int))
 	t1 := gtExp(&ct.Ka, new(big.Int).Neg(xiKeyInt))
-	t2 := gtExp(&psiA, big.NewInt(-cw))
+	t2 := gtExp(&psiA, new(big.Int).Neg(cw))
 	var target bn254.GT
 	target.Mul(&lambdaA, &t1)
 	target.Mul(&target, &t2)
-	bound := (int64(N) + 1) * (par.G + 1)
-	t, ok := search(&psiA, &target, bound)
+	bound := new(big.Int).Mul(big.NewInt(int64(N)+1), big.NewInt(par.G+1))
+
+	var t *big.Int
+	var ok bool
+	var sStats SearchStats
+	if par.Fast {
+		t, ok, sStats = searchOutwardSignFP64(&psiA, &target, bound, N, par.G)
+	} else {
+		t, ok, sStats = searchBigWithStats(&psiA, &target, bound)
+	}
+	sStats.Center = new(big.Int).Set(cw)
+	rep.Search = sStats
+	rep.SearchDur = time.Since(tSearch)
 	if !ok {
-		return nil, ErrFailed
+		rep.TotalDur = time.Since(totalStart)
+		return nil, rep, ErrFailed
 	}
 
 	// Line 11: K = (Lambda - (cw + t) * Psi) / xiKey.
-	t3 := gtExp(&psi, big.NewInt(-(cw + t)))
+	rw := new(big.Int).Add(cw, t)
+	rep.Search.SecretSum = new(big.Int).Set(rw)
+	t3 := gtExp(&psi, new(big.Int).Neg(rw))
 	var key bn254.GT
 	key.Mul(&lambda, &t3)
 	var xiInv fr.Element
 	xiInv.Inverse(&xiKey)
 	key = gtExp(&key, xiInv.BigInt(new(big.Int)))
-	return xor(ct.Msg, keyPad(&key, len(ct.Msg))), nil
+	rep.TotalDur = time.Since(totalStart)
+	return xor(ct.Msg, keyPad(&key, len(ct.Msg))), rep, nil
 }
 
-// center is the middle of the range the secret sum r(w) can take under the
+// centerBig is the middle of the range the secret sum r(w) can take under the
 // centered sampler (Section 5.2):
 // floor(ceil(N(g+1)/2) + (g+3)/2 * (1 + wt(w) - N/2)).
-func center(N int, g int64, w []bool) int64 {
+func centerBig(N int, g int64, w []bool) *big.Int {
 	var wt int64
 	for _, on := range w[1:] {
 		if on {
 			wt++
 		}
 	}
-	a := (int64(N)*(g+1) + 1) / 2
-	num := (g + 3) * (2 + 2*wt - int64(N)) // four times the second term
-	fl := num / 4
-	if num%4 != 0 && num < 0 {
-		fl--
-	}
-	return a + fl
+	a := new(big.Int).Mul(big.NewInt(int64(N)), big.NewInt(g+1))
+	a.Add(a, big.NewInt(1))
+	a.Rsh(a, 1)
+
+	// Four times the second term: (g + 3) * (2 + 2*wt - N).
+	num := new(big.Int).Mul(big.NewInt(g+3), big.NewInt(2+2*wt-int64(N)))
+	fl := new(big.Int).Div(num, big.NewInt(4)) // Euclidean division: floor(num / 4)
+	return a.Add(a, fl)
 }
 
-// search returns the integer t with |t| <= bound and base^t = target, by
-// baby steps and giant steps over the whole range. The paper searches
-// outward from zero, which is faster on average; at the demo's range the
-// difference does not matter.
+func center(N int, g int64, w []bool) int64 {
+	return centerBig(N, g, w).Int64()
+}
+
+// search returns the integer t of least absolute value with |t| <= bound and
+// base^t = target.
 func search(base, target *bn254.GT, bound int64) (int64, bool) {
+	t, ok := searchBig(base, target, big.NewInt(bound))
+	if !ok {
+		return 0, false
+	}
+	return t.Int64(), true
+}
+
+// searchBig searches growing intervals |t| <= r up to bound by baby steps and
+// giant steps (Proposition 5.7(d)), returning the solution of least absolute
+// value in [-bound, bound].
+func searchBig(base, target *bn254.GT, bound *big.Int) (*big.Int, bool) {
+	t, ok, _ := searchBigWithStats(base, target, bound)
+	return t, ok
+}
+
+func searchBigWithStats(base, target *bn254.GT, bound *big.Int) (*big.Int, bool, SearchStats) {
+	stats := SearchStats{
+		Algorithm: "growing-bsgs",
+		Bound:     new(big.Int).Set(bound),
+	}
+	if bound.Sign() < 0 {
+		return nil, false, stats
+	}
+	if target.IsOne() {
+		stats.Offset = new(big.Int)
+		stats.Rounds = 1
+		return new(big.Int), true, stats
+	}
 	if base.IsOne() {
-		return 0, target.IsOne()
+		return nil, false, stats
 	}
-	// Look for u = t + bound in [0, 2*bound].
-	m := int64(1)
-	for m*m < 2*bound+1 {
-		m++
+	r := big.NewInt(1024)
+	if r.Cmp(bound) > 0 {
+		r.Set(bound)
 	}
+	for {
+		stats.Rounds++
+		t, bSteps, gSteps, ok := bsgsInterval(base, target, r)
+		stats.BabySteps += bSteps
+		stats.GiantSteps += gSteps
+		if bSteps*int64(bn254.SizeOfGT+8) > stats.TableBytes {
+			stats.TableBytes = bSteps * int64(bn254.SizeOfGT+8)
+		}
+		if ok {
+			stats.Offset = t
+			return t, true, stats
+		}
+		if r.Cmp(bound) >= 0 {
+			return nil, false, stats
+		}
+		r.Lsh(r, 4) // multiply radius by 16 (step count by 4)
+		if r.Cmp(bound) > 0 {
+			r.Set(bound)
+		}
+	}
+}
+
+func bsgsInterval(base, target *bn254.GT, r *big.Int) (*big.Int, int64, int64, bool) {
+	// Look for u = t + r in [0, 2*r].
+	twoR := new(big.Int).Lsh(r, 1)
+	span := new(big.Int).Add(twoR, big.NewInt(1)) // 2*r + 1
+	mBig := new(big.Int).Sqrt(span)
+	if new(big.Int).Mul(mBig, mBig).Cmp(span) < 0 {
+		mBig.Add(mBig, big.NewInt(1))
+	}
+	m := mBig.Int64()
 	table := make(map[[bn254.SizeOfGT]byte]int64, m)
 	var cur bn254.GT
 	cur.SetOne()
 	for b := int64(0); b < m; b++ {
-		table[cur.Bytes()] = b
+		key := cur.Bytes()
+		if _, exists := table[key]; !exists {
+			table[key] = b
+		}
 		cur.Mul(&cur, base)
 	}
 	var giant, shifted bn254.GT
 	giant.Inverse(&cur) // base^-m
-	shifted.Exp(*base, big.NewInt(bound))
+	shifted.Exp(*base, r)
 	shifted.Mul(&shifted, target)
+
+	var best, bestAbs *big.Int
+	var u, cand, candAbs big.Int
 	for j := int64(0); j <= m; j++ {
 		if b, ok := table[shifted.Bytes()]; ok {
-			if u := j*m + b; u <= 2*bound {
-				return u - bound, true
+			u.Mul(big.NewInt(j), mBig)
+			u.Add(&u, big.NewInt(b))
+			if u.Cmp(twoR) <= 0 {
+				cand.Sub(&u, r)
+				candAbs.Abs(&cand)
+				if best == nil || candAbs.Cmp(bestAbs) < 0 {
+					best = new(big.Int).Set(&cand)
+					bestAbs = new(big.Int).Set(&candAbs)
+				}
 			}
 		}
 		shifted.Mul(&shifted, &giant)
 	}
-	return 0, false
+	if best != nil {
+		return best, m, m + 1, true
+	}
+	return nil, m, m + 1, false
 }

@@ -2,63 +2,56 @@
 
 Output docs/demo.gif
 
-Set Shell bash
-Set FontSize 18
-Set Width 1280
-Set Height 720
-Set Padding 24
-Set Theme "Catppuccin Mocha"
+Set Shell "bash"
+Set FontSize 16
+Set Width 1480
+Set Height 820
+Set Padding 20
+Set Framerate 24
 Set TypingSpeed 35ms
+Set Theme {"background":"#12101a","foreground":"#f8f8f2","cursor":"#e135ff"}
 
-# Build the tool out of sight and put it on the path.
+# Build the tool out of sight and put it on PATH.
 Hide
-Type "export PRAXIS_BIN=$(mktemp -d) && go build -o $PRAXIS_BIN/praxis ./cmd/praxis && export PATH=$PRAXIS_BIN:$PATH && cd $PRAXIS_BIN && export PS1='$ ' && clear"
+Type@0ms "export PRAXIS_BIN=$(mktemp -d) && go build -o $PRAXIS_BIN/praxis ./cmd/praxis && export PATH=$PRAXIS_BIN:$PATH && export PS1='$ ' && clear"
 Enter
 Sleep 4s
 Show
 
-Type "# Witness encryption: lock a message to a puzzle, not to a key."
+Type "praxis tui"
 Enter
+Sleep 2s
+
+# 1. Semiprime Factoring (R1CS) in Advanced Mode: encrypt & unlock with (p, q).
+Type "e"
 Sleep 1.5s
-Type "# Lock it to a number. Whoever knows the factors can read it."
-Enter
-Sleep 1s
-Type 'praxis encrypt factor 3214085717 16 "meet at the old pier" note.ct'
-Enter
-Sleep 3s
-
-Type "# Wrong factors get nothing."
-Enter
-Sleep 500ms
-Type "praxis decrypt note.ct 64283 49998"
-Enter
-Sleep 3s
-
-Type "# The right ones open it. No key was ever made."
-Enter
-Sleep 500ms
-Type "praxis decrypt note.ct 64283 49999"
-Enter
-Sleep 4s
-
-Type "clear"
-Enter
-Type "# Or lock it to a graph: whoever can colour it can read it."
-Enter
-Sleep 1s
-Type 'praxis encrypt colour 0-1,1-2,2-0,2-3,3-0 3 "any valid colouring works" graph.ct'
-Enter
-Sleep 3s
-Type "praxis decrypt graph.ct 0,1,2,1"
-Enter
+Type "d"
 Sleep 2.5s
-Type "praxis decrypt graph.ct 2,0,1,0"
-Enter
+
+# 2. Petersen Graph 3-Colouring (nu=4 cosets): unlock with w1, alternate w2, then tamper x.
+Type "2"
+Sleep 1s
+Type "d"
+Sleep 2.2s
+Type "w"
+Sleep 2.5s
+Type "x"
+Sleep 2.5s
+
+# 3. 3-SAT Gate Circuit: live side-by-side Toy vs Advanced benchmark, and toggle modes.
+Type "3"
+Sleep 1s
+Type "c"
 Sleep 3s
-Type "# Demonstration parameters. Not secure."
-Enter
-Sleep 3s
+
+Tab
+Sleep 1.5s
+Tab
+Sleep 2s
+
+Type "q"
+Sleep 800ms
 
 Hide
-Type "cd / && rm -rf $PRAXIS_BIN"
+Type@0ms "rm -rf $PRAXIS_BIN"
 Enter
