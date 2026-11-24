@@ -1,8 +1,11 @@
 // Package tui implements an interactive Charm v2 workbench for exploring Praxis
-// witness encryption across Toy and Advanced (Figures 9–10) modes.
+// witness encryption across Toy and Advanced (Figures 9–10) modes, including a
+// live operator-free 2-of-2 Bitcoin Private Signet Taproot bridge vault.
 package tui
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
@@ -15,23 +18,24 @@ import (
 
 	"praxis-demo/bqs"
 	"praxis-demo/praxis"
+	"praxis-demo/signet"
 )
 
 // SilkCircuit Neon palette (matching cherry-pi's surface/ink/accent hierarchy).
 var (
-	colBg       = lipgloss.Color("#12101a")
-	colPane     = lipgloss.Color("#181425")
-	colHeader   = lipgloss.Color("#221e32")
-	colRule     = lipgloss.Color("#39305c")
-	colInk      = lipgloss.Color("#f8f8f2")
-	colSub      = lipgloss.Color("#e9d5ff")
-	colMuted    = lipgloss.Color("#768d8d")
-	colPurple   = lipgloss.Color("#e135ff")
-	colCyan     = lipgloss.Color("#80ffea")
-	colGreen    = lipgloss.Color("#50fa7b")
-	colCoral    = lipgloss.Color("#ff6ac1")
-	colRed      = lipgloss.Color("#ff6363")
-	colYellow   = lipgloss.Color("#f1fa8c")
+	colBg     = lipgloss.Color("#12101a")
+	colPane   = lipgloss.Color("#181425")
+	colHeader = lipgloss.Color("#221e32")
+	colRule   = lipgloss.Color("#39305c")
+	colInk    = lipgloss.Color("#f8f8f2")
+	colSub    = lipgloss.Color("#e9d5ff")
+	colMuted  = lipgloss.Color("#768d8d")
+	colPurple = lipgloss.Color("#e135ff")
+	colCyan   = lipgloss.Color("#80ffea")
+	colGreen  = lipgloss.Color("#50fa7b")
+	colCoral  = lipgloss.Color("#ff6ac1")
+	colRed    = lipgloss.Color("#ff6363")
+	colYellow = lipgloss.Color("#f1fa8c")
 
 	stTitle    = lipgloss.NewStyle().Foreground(colInk).Bold(true)
 	stPurple   = lipgloss.NewStyle().Foreground(colPurple).Bold(true)
@@ -50,15 +54,16 @@ var (
 
 // Scenario is one built-in NP statement with two distinct witnesses.
 type Scenario struct {
-	Name      string
-	Tag       string
-	Statement string
-	Message   string
-	RawSys    *bqs.System
-	Witness1  []bool
-	Wit1Desc  string
-	Witness2  []bool
-	Wit2Desc  string
+	Name       string
+	Tag        string
+	Statement  string
+	Message    string
+	RawSys     *bqs.System
+	Witness1   []bool
+	Wit1Desc   string
+	Witness2   []bool
+	Wit2Desc   string
+	LiveSignet bool
 }
 
 func buildScenarios() []Scenario {
@@ -87,6 +92,23 @@ func buildScenarios() []Scenario {
 	sSAT, _ := bqs.ThreeSAT(6, clauses)
 	wSAT1 := bqs.ThreeSATWitness([]bool{true, true, false, true, false, true}, clauses)
 	wSAT2 := bqs.ThreeSATWitness([]bool{false, true, false, false, false, false}, clauses)
+
+	// 4. Operator-free 2-of-2 Bitcoin Private Signet Taproot Bridge Vault.
+	initCtx := bqs.BridgeContext{
+		VaultOutPoint:    "pending-signet-utxo:0",
+		RecipientAddress: "tb1p-pending-signet-claimer",
+		AmountSats:       signet.VaultWithdrawSats,
+	}
+	s1 := [16]byte{0xca, 0xfe, 0xba, 0xbe, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc}
+	s3 := [16]byte{0xde, 0xad, 0xbe, 0xef, 0xf0, 0x0d, 0xca, 0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
+	var batch [bqs.BridgeBatchSlots]bqs.BridgeNoteCommitment
+	batch[0] = bqs.CommitBridgeBurn(initCtx, [16]byte{1})
+	batch[1] = bqs.CommitBridgeBurn(initCtx, s1)
+	batch[2] = bqs.CommitBridgeBurn(initCtx, [16]byte{2})
+	batch[3] = bqs.CommitBridgeBurn(initCtx, s3)
+	sBridge, _ := bqs.BridgeBurn(initCtx, batch)
+	wBridge1, _ := bqs.BridgeBurnWitness(1, s1)
+	wBridge2, _ := bqs.BridgeBurnWitness(3, s3)
 
 	return []Scenario{
 		{
@@ -122,17 +144,45 @@ func buildScenarios() []Scenario {
 			Witness2:  wSAT2,
 			Wit2Desc:  "x = (0,1,0,0,0,0) · low weight",
 		},
+		{
+			Name:       "Signet 2-of-2 Bridge",
+			Tag:        "2-of-2 P2TR · 132v",
+			Statement:  "L2 burn Q_ctx(s)==C_j unlocks Depositor's 1/2 PSBT",
+			Message:    "depositor-1of2-tapscript-psbt",
+			RawSys:     sBridge,
+			Witness1:   wBridge1,
+			Wit1Desc:   "L2 Burn Slot #1 · 128-bit preimage s_A",
+			Witness2:   wBridge2,
+			Wit2Desc:   "L2 Burn Slot #3 · 128-bit preimage s_B",
+			LiveSignet: true,
+		},
 	}
 }
 
+type signetVaultState struct {
+	status       signet.ChainStatus
+	vault        *signet.LockedVault
+	depRug       signet.UnilateralAttempt
+	clmEarly     signet.UnilateralAttempt
+	settlement   *signet.SweepSettlement
+	utxoUnspent  bool
+	secret1Hex   string
+	secret3Hex   string
+	alreadySwept bool
+}
+
 type decOutcome struct {
-	label     string
-	witDesc   string
-	witWeight int
-	unchecked bool
-	plaintext string
-	err       error
-	rep       praxis.DecReport
+	label          string
+	witDesc        string
+	witWeight      int
+	unchecked      bool
+	plaintext      string
+	recoveredBytes []byte
+	err            error
+	rep            praxis.DecReport
+	settlement     *signet.SweepSettlement
+	utxoStillSafe  bool
+	alreadySwept   bool
 }
 
 type compareResult struct {
@@ -159,6 +209,9 @@ type Model struct {
 	encRep   praxis.EncReport
 	hasCT    bool
 
+	sigEnv   *signet.Env
+	sigState *signetVaultState
+
 	lastDec *decOutcome
 	cmp     *compareResult
 	busy    string
@@ -175,10 +228,22 @@ type encDoneMsg struct {
 	ct  *praxis.Ciphertext
 	rep praxis.EncReport
 	err error
+
+	sigEnv   *signet.Env
+	sigState *signetVaultState
+	newPP    *praxis.Public
+	setupDur time.Duration
+	newSc    *Scenario
 }
 
 type decDoneMsg struct {
-	out decOutcome
+	out      decOutcome
+	sigEnv   *signet.Env
+	sigState *signetVaultState
+	newPP    *praxis.Public
+	newCT    *praxis.Ciphertext
+	newRep   *praxis.EncReport
+	newSc    *Scenario
 }
 
 type cmpDoneMsg struct {
@@ -191,8 +256,8 @@ func New(startAdvanced bool) *Model {
 	m := &Model{
 		scenarios: buildScenarios(),
 		advanced:  startAdvanced,
-		width:     112,
-		height:    34,
+		width:     118,
+		height:    36,
 	}
 	m.runSetupSync()
 	return m
@@ -219,6 +284,7 @@ func (m *Model) runSetupSync() {
 		m.hasCT = false
 		m.ct = nil
 		m.lastDec = nil
+		m.sigState = nil
 	}
 }
 
@@ -231,28 +297,159 @@ func (m *Model) pushLog(entry string) {
 
 func (m *Model) Init() tea.Cmd { return nil }
 
+// lockSignetVaultAndEncrypt funds a 2-of-2 tr(NUMS, multi_a(2, Depositor, Claimer))
+// UTXO on Signet (keeping BOTH private keys live), verifies neither party can spend
+// unilaterally, and Praxis-encrypts Depositor's 1-of-2 partial PSBT.
+func lockSignetVaultAndEncrypt(existingEnv *signet.Env, par praxis.Params, baseSc Scenario) (*signet.Env, *signetVaultState, *praxis.Public, time.Duration, *praxis.Ciphertext, praxis.EncReport, Scenario, error) {
+	env := existingEnv
+	var err error
+	if env == nil {
+		env, err = signet.ConnectAttachOrStart("", "")
+		if err != nil {
+			return nil, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+		}
+	}
+	vault, err := env.LockTaprootVault()
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+	depRug, err := env.AttemptUnilateralSpend(vault, "depositor")
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+	clmEarly, err := env.AttemptUnilateralSpend(vault, "claimer")
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+	st, err := env.Status()
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+
+	ctx := bqs.BridgeContext{
+		VaultOutPoint:    vault.OutPoint(),
+		RecipientAddress: vault.RecipientAddress,
+		AmountSats:       vault.WithdrawSats,
+	}
+	var secrets [bqs.BridgeBatchSlots][16]byte
+	for i := range secrets {
+		_, _ = rand.Read(secrets[i][:])
+	}
+	var batch [bqs.BridgeBatchSlots]bqs.BridgeNoteCommitment
+	for i := range batch {
+		batch[i] = bqs.CommitBridgeBurn(ctx, secrets[i])
+	}
+	rawSys, err := bqs.BridgeBurn(ctx, batch)
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+	w1, _ := bqs.BridgeBurnWitness(1, secrets[1])
+	w2, _ := bqs.BridgeBurnWitness(3, secrets[3])
+
+	tSetup := time.Now()
+	pp, err := praxis.Setup(par, rawSys.PadConstraints(par.JRem()))
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+	setupDur := time.Since(tSetup)
+
+	ct, rep, err := praxis.EncDetailed(pp, vault.DepositorPartialPSBT)
+	for i := range vault.DepositorPartialPSBT {
+		vault.DepositorPartialPSBT[i] = 0
+	}
+	vault.DepositorPartialPSBT = nil
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
+
+	s1Hex := hex.EncodeToString(secrets[1][:])
+	s3Hex := hex.EncodeToString(secrets[3][:])
+	updatedSc := baseSc
+	updatedSc.RawSys = rawSys
+	updatedSc.Witness1 = w1
+	updatedSc.Witness2 = w2
+	updatedSc.Wit1Desc = fmt.Sprintf("Slot #1 · secret %s…", s1Hex[:12])
+	updatedSc.Wit2Desc = fmt.Sprintf("Slot #3 · secret %s…", s3Hex[:12])
+	updatedSc.Statement = fmt.Sprintf("2-of-2 %s…:%d -> %s…", vault.DepositTxID[:10], vault.DepositVout, vault.RecipientAddress[:14])
+
+	sv := &signetVaultState{
+		status:      st,
+		vault:       vault,
+		depRug:      depRug,
+		clmEarly:    clmEarly,
+		utxoUnspent: true,
+		secret1Hex:  s1Hex,
+		secret3Hex:  s3Hex,
+	}
+	return env, sv, pp, setupDur, ct, rep, updatedSc, nil
+}
+
 func (m *Model) cmdEncrypt() tea.Cmd {
+	sc := m.scenarios[m.cursor]
+	par := m.activeParams()
 	pp := m.pp
-	msg := []byte(m.scenarios[m.cursor].Message)
+	existingEnv := m.sigEnv
 	return func() tea.Msg {
-		ct, rep, err := praxis.EncDetailed(pp, msg)
+		if sc.LiveSignet {
+			env, sv, newPP, setupDur, ct, rep, newSc, err := lockSignetVaultAndEncrypt(existingEnv, par, sc)
+			return encDoneMsg{
+				ct:       ct,
+				rep:      rep,
+				err:      err,
+				sigEnv:   env,
+				sigState: sv,
+				newPP:    newPP,
+				setupDur: setupDur,
+				newSc:    &newSc,
+			}
+		}
+		ct, rep, err := praxis.EncDetailed(pp, []byte(sc.Message))
 		return encDoneMsg{ct: ct, rep: rep, err: err}
 	}
 }
 
 func (m *Model) cmdDecrypt(which int) tea.Cmd {
 	sc := m.scenarios[m.cursor]
+	par := m.activeParams()
 	pp := m.pp
 	ct := m.ct
+	existingEnv := m.sigEnv
+	existingSig := m.sigState
+
 	return func() tea.Msg {
-		// Auto-encrypt first if user presses d/w/x before encrypting.
+		var autoPP *praxis.Public
+		var autoCT *praxis.Ciphertext
+		var autoRep *praxis.EncReport
+		var autoSc *Scenario
+		env := existingEnv
+		sig := existingSig
+
 		if ct == nil {
-			var err error
-			ct, _, err = praxis.EncDetailed(pp, []byte(sc.Message))
-			if err != nil {
-				return decDoneMsg{out: decOutcome{err: err}}
+			if sc.LiveSignet {
+				var newSc Scenario
+				var rep praxis.EncReport
+				var err error
+				env, sig, pp, _, ct, rep, newSc, err = lockSignetVaultAndEncrypt(env, par, sc)
+				if err != nil {
+					return decDoneMsg{out: decOutcome{err: err}, sigEnv: env}
+				}
+				sc = newSc
+				autoPP = pp
+				autoCT = ct
+				autoRep = &rep
+				autoSc = &newSc
+			} else {
+				var rep praxis.EncReport
+				var err error
+				ct, rep, err = praxis.EncDetailed(pp, []byte(sc.Message))
+				if err != nil {
+					return decDoneMsg{out: decOutcome{err: err}}
+				}
+				autoCT = ct
+				autoRep = &rep
 			}
 		}
+
 		var w []bool
 		var label, desc string
 		var unchecked bool
@@ -286,15 +483,61 @@ func (m *Model) cmdDecrypt(which int) tea.Cmd {
 		} else {
 			plain, rep, err = praxis.DecDetailed(pp, ct, w)
 		}
-		return decDoneMsg{out: decOutcome{
-			label:     label,
-			witDesc:   desc,
-			witWeight: wt,
-			unchecked: unchecked,
-			plaintext: string(plain),
-			err:       err,
-			rep:       rep,
-		}}
+
+		out := decOutcome{
+			label:          label,
+			witDesc:        desc,
+			witWeight:      wt,
+			unchecked:      unchecked,
+			plaintext:      string(plain),
+			recoveredBytes: plain,
+			err:            err,
+			rep:            rep,
+		}
+
+		if sc.LiveSignet && env != nil && sig != nil && sig.vault != nil {
+			if err != nil {
+				if unspent, uerr := env.IsOutPointUnspent(sig.vault.DepositTxID, sig.vault.DepositVout); uerr == nil {
+					sig.utxoUnspent = unspent
+					out.utxoStillSafe = unspent
+				}
+			} else {
+				unspent, uerr := env.IsOutPointUnspent(sig.vault.DepositTxID, sig.vault.DepositVout)
+				if uerr == nil && unspent {
+					settle, serr := env.CoSignAndSweep(sig.vault, plain)
+					if serr != nil {
+						out.err = serr
+					} else {
+						sig.settlement = settle
+						sig.utxoUnspent = false
+						if st, stErr := env.Status(); stErr == nil {
+							sig.status = st
+						}
+						out.settlement = settle
+						out.plaintext = fmt.Sprintf("1/2 PSBT (%d B) + Claimer sig -> %d-item OP_CHECKSIGADD tx", len(plain), settle.WitnessItems)
+					}
+				} else {
+					_, txid, witItems, ferr := env.CoSignFinalizeOnly(sig.vault, plain)
+					if ferr != nil {
+						out.err = ferr
+					} else {
+						out.alreadySwept = true
+						out.settlement = sig.settlement
+						out.plaintext = fmt.Sprintf("2-of-2 finalized (%d items · txid %s…)", witItems, txid[:16])
+					}
+				}
+			}
+		}
+
+		return decDoneMsg{
+			out:      out,
+			sigEnv:   env,
+			sigState: sig,
+			newPP:    autoPP,
+			newCT:    autoCT,
+			newRep:   autoRep,
+			newSc:    autoSc,
+		}
 	}
 }
 
@@ -340,6 +583,13 @@ func (m *Model) cmdCompare() tea.Cmd {
 	}
 }
 
+func (m *Model) cleanup() {
+	if m.sigEnv != nil {
+		_ = m.sigEnv.Close()
+		m.sigEnv = nil
+	}
+}
+
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -357,9 +607,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case encDoneMsg:
 		m.busy = ""
+		if msg.sigEnv != nil {
+			m.sigEnv = msg.sigEnv
+		}
 		if msg.err != nil {
 			m.pushLog("encrypt error: " + msg.err.Error())
 			return m, nil
+		}
+		if msg.newSc != nil {
+			m.scenarios[m.cursor] = *msg.newSc
+		}
+		if msg.newPP != nil {
+			m.pp = msg.newPP
+			m.setupDur = msg.setupDur
+		}
+		if msg.sigState != nil {
+			m.sigState = msg.sigState
 		}
 		m.ct = msg.ct
 		m.encRep = msg.rep
@@ -369,22 +632,55 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.advanced {
 			modeTag = "ADV"
 		}
-		m.pushLog(fmt.Sprintf("[%s] Encrypted %s -> %s (%d G1 + %d G2, %v)",
-			modeTag, m.scenarios[m.cursor].Name, fmtBytes(msg.rep.Bytes),
-			msg.rep.G1, msg.rep.G2, msg.rep.EncDur.Round(time.Millisecond)))
+		if msg.sigState != nil && msg.sigState.vault != nil {
+			v := msg.sigState.vault
+			m.pushLog(fmt.Sprintf("[%s] Funded 2-of-2 P2TR %s… (#%d, both keys LIVE; unilateral spends BLOCKED), sealed 1/2 PSBT",
+				modeTag, v.VaultAddress[:12], v.DepositBlock))
+		} else {
+			m.pushLog(fmt.Sprintf("[%s] Encrypted %s -> %s (%d G1 + %d G2, %v)",
+				modeTag, m.scenarios[m.cursor].Name, fmtBytes(msg.rep.Bytes),
+				msg.rep.G1, msg.rep.G2, msg.rep.EncDur.Round(time.Millisecond)))
+		}
 		return m, nil
 
 	case decDoneMsg:
 		m.busy = ""
+		if msg.sigEnv != nil {
+			m.sigEnv = msg.sigEnv
+		}
+		if msg.newSc != nil {
+			m.scenarios[m.cursor] = *msg.newSc
+		}
+		if msg.newPP != nil {
+			m.pp = msg.newPP
+		}
+		if msg.newCT != nil {
+			m.ct = msg.newCT
+			m.hasCT = true
+		}
+		if msg.newRep != nil {
+			m.encRep = *msg.newRep
+		}
+		if msg.sigState != nil {
+			m.sigState = msg.sigState
+		}
 		o := msg.out
 		m.lastDec = &o
 		if o.err == nil {
-			m.pushLog(fmt.Sprintf("Decrypted via %s in %v (offset t=%s, %d+%d steps)",
-				o.label, o.rep.TotalDur.Round(time.Millisecond),
-				fmtSigned(o.rep.Search.Offset), o.rep.Search.BabySteps, o.rep.Search.GiantSteps))
+			if o.settlement != nil && !o.alreadySwept {
+				m.pushLog(fmt.Sprintf("Co-signed 2-of-2 via %s (Depositor offline) -> tx %s… settled @ #%d",
+					o.label, o.settlement.SweepTxID[:12], o.settlement.BlockHeight))
+			} else {
+				m.pushLog(fmt.Sprintf("Decrypted via %s in %v (offset t=%s, %d+%d steps)",
+					o.label, o.rep.TotalDur.Round(time.Millisecond),
+					fmtSigned(o.rep.Search.Offset), o.rep.Search.BabySteps, o.rep.Search.GiantSteps))
+			}
 		} else {
-			m.pushLog(fmt.Sprintf("Rejected %s in %v (exact QAP=%v -> no key found)",
-				o.label, o.rep.TotalDur.Round(time.Millisecond), o.rep.ExactQAP))
+			if o.utxoStillSafe {
+				m.pushLog(fmt.Sprintf("Rejected %s -> 2-of-2 Signet UTXO verified UNSPENT (1.0 sBTC safe)", o.label))
+			} else {
+				m.pushLog(fmt.Sprintf("Rejected %s (%v)", o.label, o.err))
+			}
 		}
 		return m, nil
 
@@ -404,6 +700,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
+			m.cleanup()
 			return m, tea.Quit
 		case "m", "tab":
 			m.advanced = !m.advanced
@@ -422,7 +719,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = (m.cursor + 1) % len(m.scenarios)
 			m.cmp = nil
 			m.runSetupSync()
-		case "1", "2", "3":
+		case "1", "2", "3", "4":
 			idx := int(msg.String()[0] - '1')
 			if idx >= 0 && idx < len(m.scenarios) {
 				m.cursor = idx
@@ -430,38 +727,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.runSetupSync()
 			}
 		case "e", "enter":
-			m.busy = "Encrypting statement (Fig. 9)..."
+			if m.scenarios[m.cursor].LiveSignet {
+				m.busy = "Funding 2-of-2 P2TR vault, checking unilateral blocks & sealing 1/2 PSBT..."
+			} else {
+				m.busy = "Encrypting statement (Fig. 9)..."
+			}
 			m.cmp = nil
 			return m, m.cmdEncrypt()
 		case "d":
-			if !m.hasCT {
-				// Encrypt synchronously first so both ct and decryption stay stored.
-				ct, rep, err := praxis.EncDetailed(m.pp, []byte(m.scenarios[m.cursor].Message))
-				if err == nil {
-					m.ct, m.encRep, m.hasCT = ct, rep, true
-				}
+			if m.scenarios[m.cursor].LiveSignet {
+				m.busy = "Proving L2 burn w1 -> decrypt 1/2 PSBT -> Claimer co-sign & mine..."
+			} else {
+				m.busy = "Decrypting with witness w1 (Fig. 10)..."
 			}
-			m.busy = "Decrypting with witness w1 (Fig. 10)..."
 			m.cmp = nil
 			return m, m.cmdDecrypt(1)
 		case "w":
-			if !m.hasCT {
-				ct, rep, err := praxis.EncDetailed(m.pp, []byte(m.scenarios[m.cursor].Message))
-				if err == nil {
-					m.ct, m.encRep, m.hasCT = ct, rep, true
-				}
+			if m.scenarios[m.cursor].LiveSignet {
+				m.busy = "Proving alternate L2 burn w2 -> decrypt 1/2 PSBT & co-sign..."
+			} else {
+				m.busy = "Decrypting same ciphertext with alternate witness w2..."
 			}
-			m.busy = "Decrypting same ciphertext with alternate witness w2..."
 			m.cmp = nil
 			return m, m.cmdDecrypt(2)
 		case "x":
-			if !m.hasCT {
-				ct, rep, err := praxis.EncDetailed(m.pp, []byte(m.scenarios[m.cursor].Message))
-				if err == nil {
-					m.ct, m.encRep, m.hasCT = ct, rep, true
-				}
+			if m.scenarios[m.cursor].LiveSignet {
+				m.busy = "Attacking vault with forged burn proof (DecUnchecked)..."
+			} else {
+				m.busy = "Running DecUnchecked on tampered witness..."
 			}
-			m.busy = "Running DecUnchecked on tampered witness..."
 			m.cmp = nil
 			return m, m.cmdDecrypt(3)
 		case "c":
@@ -501,7 +795,7 @@ func cardBox(lines []string, innerW int, focused bool) string {
 	bodyBg := lipgloss.NewStyle().Background(colPane)
 	var out []string
 	for _, ln := range lines {
-		padded := " " + padOrTrim(ln, innerW-2) + " "
+		padded := " " + padOrTrim(ln, innerW-4) + " "
 		out = append(out, leftEdge+bodyBg.Render(padded)+rightEdge)
 	}
 	return strings.Join(out, "\n")
@@ -545,13 +839,12 @@ func (m *Model) View() tea.View {
 	gap := max(2, inner-ansi.StringWidth(mark)-ansi.StringWidth(rightHead))
 	header := " " + mark + strings.Repeat(" ", gap) + rightHead
 
-	// Two columns: Left = Statements & Mode Spec; Right = Live QAP, Chunks & Telemetry.
 	leftW := min(52, inner*42/100)
 	rightW := inner - leftW - 2
 
 	// --- LEFT COLUMN ---
 	var leftLines []string
-	leftLines = append(leftLines, sectionBar("NP STATEMENTS", "1-3 / ↑↓", leftW-2))
+	leftLines = append(leftLines, sectionBar("NP STATEMENTS", "1-4 / ↑↓", leftW-4))
 	for i, sc := range m.scenarios {
 		prefix := "  "
 		nameRendered := stSub.Render(sc.Name)
@@ -581,14 +874,14 @@ func (m *Model) View() tea.View {
 		extDesc = fmt.Sprintf("F_q[T]/(T^%d - c0) · Serret 2,3|n", par.NForms())
 		searchAlg = "Outward {V,V^-1} sign-FP64 (12 B/step)"
 	}
-	leftLines = append(leftLines, sectionBar("ACTIVE ENGINE · "+modeName, "tab", leftW-2))
+	leftLines = append(leftLines, sectionBar("ACTIVE ENGINE · "+modeName, "tab", leftW-4))
 	leftLines = append(leftLines, kvRow("Ring / Grid", fmt.Sprintf("dR=%d, K=%d -> %d forms, %dx%d=%d cells",
-		par.DR, par.K, par.NForms(), par.K1, 3*par.K2, par.Cells()), leftW-2))
-	leftLines = append(leftLines, kvRow("Extension", extDesc, leftW-2))
-	leftLines = append(leftLines, kvRow("Power Chunks", fmt.Sprintf("J=%d quo, J'=%d rem", par.JQuo(), par.JRem()), leftW-2))
-	leftLines = append(leftLines, kvRow("QAP Engine", qapAlg, leftW-2))
-	leftLines = append(leftLines, kvRow("Secret Range", fmt.Sprintf("g = 2^%d (%d)", int(math.Log2(float64(par.G))), par.G), leftW-2))
-	leftLines = append(leftLines, kvRow("DL Search", searchAlg, leftW-2))
+		par.DR, par.K, par.NForms(), par.K1, 3*par.K2, par.Cells()), leftW-4))
+	leftLines = append(leftLines, kvRow("Extension", extDesc, leftW-4))
+	leftLines = append(leftLines, kvRow("Power Chunks", fmt.Sprintf("J=%d quo, J'=%d rem", par.JQuo(), par.JRem()), leftW-4))
+	leftLines = append(leftLines, kvRow("QAP Engine", qapAlg, leftW-4))
+	leftLines = append(leftLines, kvRow("Secret Range", fmt.Sprintf("g = 2^%d (%d)", int(math.Log2(float64(par.G))), par.G), leftW-4))
+	leftLines = append(leftLines, kvRow("DL Search", searchAlg, leftW-4))
 
 	// --- RIGHT COLUMN ---
 	var rightLines []string
@@ -596,7 +889,7 @@ func (m *Model) View() tea.View {
 	g1Count, g2Count := pp.Counts()
 	c0 := pp.C0()
 	c0Int := c0.BigInt(new(big.Int))
-	rightLines = append(rightLines, sectionBar("QAP & CHUNK GEOMETRY", fmt.Sprintf("Setup %v", m.setupDur.Round(100*time.Microsecond)), rightW-2))
+	rightLines = append(rightLines, sectionBar("QAP & CHUNK GEOMETRY", fmt.Sprintf("Setup %v", m.setupDur.Round(100*time.Microsecond)), rightW-4))
 	rightLines = append(rightLines, fmt.Sprintf("%s %s   %s %s   %s %s   %s %s",
 		stMuted.Render("N="), stCoral.Render(fmt.Sprintf("%d", pp.S.N)),
 		stMuted.Render("nc="), stCoral.Render(fmt.Sprintf("%d", len(pp.S.Constraints))),
@@ -614,13 +907,48 @@ func (m *Model) View() tea.View {
 		stPurple.Render(fmt.Sprintf("%d", g2Count)),
 	))
 
+	if sc.LiveSignet {
+		rightLines = append(rightLines, "")
+		rightLines = append(rightLines, sectionBar("BITCOIN PRIVATE SIGNET · 2-OF-2 P2TR VAULT", "challenge=51", rightW-4))
+		if m.sigState == nil || m.sigState.vault == nil {
+			rightLines = append(rightLines, stMuted.Render("Script: ")+stCyan.Render("tr(NUMS, multi_a(2, Depositor, Claimer))")+stMuted.Render(" · OP_CHECKSIGADD"))
+			rightLines = append(rightLines, stMuted.Render("Press ")+stCyan.Render("[e]")+stMuted.Render(" to fund 1.0 sBTC (both keys kept LIVE; Depositor seals 1/2 PSBT)."))
+		} else {
+			sv := m.sigState
+			v := sv.vault
+			peerBadge := ""
+			if sv.status.PeerHeight >= 0 {
+				peerBadge = fmt.Sprintf(" · peer :38402 #%d", sv.status.PeerHeight)
+			}
+			utxoBadge := stYellow.Render("UNSPENT (1.0 sBTC)")
+			if !sv.utxoUnspent {
+				utxoBadge = stGreen.Render("CO-SIGNED & SWEPT")
+			}
+			rightLines = append(rightLines, fmt.Sprintf("%s %s (%s #%d%s) · %s",
+				stMuted.Render("Network:"), stCyan.Render(sv.status.Mode), sv.status.PrimaryRPC, sv.status.Height, peerBadge, utxoBadge))
+			rightLines = append(rightLines, fmt.Sprintf("%s %s · %s · %s",
+				stMuted.Render("2-of-2:"),
+				stSub.Render("BOTH KEYS LIVE"),
+				stGreen.Render(fmt.Sprintf("Dep rug-pull=%v", sv.depRug.FinalizableAlone)),
+				stGreen.Render(fmt.Sprintf("Clm alone=%v", sv.clmEarly.FinalizableAlone)),
+			))
+			rightLines = append(rightLines, fmt.Sprintf("%s %s:%d (#%d) -> %s…",
+				stMuted.Render("Deposit:"), stSub.Render(v.DepositTxID[:14]+"…"), v.DepositVout, v.DepositBlock, v.RecipientAddress[:18]))
+			if sv.settlement != nil {
+				s := sv.settlement
+				rightLines = append(rightLines, fmt.Sprintf("%s %s · #%d · %d witness items · %.5f sBTC",
+					stGreen.Render("✓ Sweep:"), stTitle.Render(s.SweepTxID[:16]+"…"), s.BlockHeight, s.WitnessItems, float64(s.RecipientSats)/1e8))
+			}
+		}
+	}
+
 	rightLines = append(rightLines, "")
 	if m.cmp != nil {
 		c := m.cmp
 		colRow := func(c1, c2, c3 string) string {
 			return "  " + padOrTrim(c1, 16) + "  " + padOrTrim(c2, 27) + "  " + padOrTrim(c3, 29)
 		}
-		rightLines = append(rightLines, sectionBar("TOY vs ADVANCED BENCHMARK", "live run", rightW-2))
+		rightLines = append(rightLines, sectionBar("TOY vs ADVANCED BENCHMARK", "live run", rightW-4))
 		rightLines = append(rightLines, colRow(
 			stMuted.Render("Metric"),
 			stCyan.Render("TOY (n=8, J=1, g=2^20)"),
@@ -642,7 +970,7 @@ func (m *Model) View() tea.View {
 			stGreen.Render(fmt.Sprintf("%d steps (%s · FP64)", c.advBaby, fmtBytes(int(c.advTable)))),
 		))
 	} else {
-		rightLines = append(rightLines, sectionBar("CRYPTOGRAPHIC PIPELINE", "Fig. 9 & 10", rightW-2))
+		rightLines = append(rightLines, sectionBar("CRYPTOGRAPHIC PIPELINE", "Fig. 9 & 10", rightW-4))
 		if !m.hasCT {
 			rightLines = append(rightLines, stMuted.Render("Press ")+stCyan.Render("[e]")+stMuted.Render(" to encrypt statement, or ")+
 				stCyan.Render("[d]")+stMuted.Render(" / ")+stCyan.Render("[w]")+stMuted.Render(" / ")+stCyan.Render("[x]")+stMuted.Render(" to run end-to-end."))
@@ -670,27 +998,39 @@ func (m *Model) View() tea.View {
 				o.rep.PairingsDur.Round(time.Millisecond),
 				o.rep.SearchDur.Round(100*time.Microsecond),
 			))
+			centerStr := "—"
+			if s.Center != nil {
+				centerStr = s.Center.String()
+			}
 			fpNote := ""
 			if s.Algorithm == "outward-sign-fp64" {
 				fpNote = fmt.Sprintf(" · FP64 hits=%d (false=%d)", s.FingerprintHits, s.FalsePositives)
 			}
 			rightLines = append(rightLines, fmt.Sprintf("%s c_w=%s · t=%s · baby=%d (%s) · giant=%d%s",
 				stMuted.Render("Search:"),
-				s.Center.String(),
+				centerStr,
 				stYellow.Render(fmtSigned(s.Offset)),
 				s.BabySteps, fmtBytes(int(s.TableBytes)),
 				s.GiantSteps, fpNote,
 			))
 			rightLines = append(rightLines, renderSearchBar(s.Offset, pp.S.N, par.G, rightW-4))
 			if o.err == nil {
-				rightLines = append(rightLines, stGreen.Render("🔓 UNLOCKED: ")+stTitle.Render(fmt.Sprintf("%q", o.plaintext)))
+				if o.settlement != nil && !o.alreadySwept {
+					rightLines = append(rightLines, stGreen.Render("🔓 SWEPT ON SIGNET: ")+
+						stTitle.Render(fmt.Sprintf("tx %s… confirmed @ #%d", o.settlement.SweepTxID[:18], o.settlement.BlockHeight)))
+				} else {
+					rightLines = append(rightLines, stGreen.Render("🔓 UNLOCKED: ")+stTitle.Render(fmt.Sprintf("%q", o.plaintext)))
+				}
 			} else {
-				rightLines = append(rightLines, stRed.Render("✗ REJECTED: ")+stSub.Render(o.err.Error()))
+				extra := ""
+				if o.utxoStillSafe {
+					extra = " · 2-of-2 UTXO still UNSPENT on Signet"
+				}
+				rightLines = append(rightLines, stRed.Render("✗ REJECTED: ")+stSub.Render(o.err.Error()+extra))
 			}
 		}
 	}
 
-	// Pad columns to equal height.
 	targetH := max(len(leftLines), len(rightLines))
 	for len(leftLines) < targetH {
 		leftLines = append(leftLines, "")
@@ -703,11 +1043,10 @@ func (m *Model) View() tea.View {
 	rightCard := cardBox(rightLines, rightW, m.hasCT)
 	columns := lipgloss.JoinHorizontal(lipgloss.Top, leftCard, "  ", rightCard)
 
-	// Activity log strip
 	var logLines []string
-	logLines = append(logLines, sectionBar("EVENT TRACE", m.busy, inner-2))
+	logLines = append(logLines, sectionBar("EVENT TRACE", m.busy, inner-4))
 	if len(m.log) == 0 {
-		logLines = append(logLines, stMuted.Render("Ready. Toggle [tab] Toy/Advanced, [e] Encrypt, [d] Witness w1, [w] Alternate w2, [x] Tamper, [c] Benchmark."))
+		logLines = append(logLines, stMuted.Render("Ready. Press [4] for 2-of-2 Bitcoin Signet Vault, [tab] Toy/Adv, [e] Lock/Encrypt, [d] Co-sign/Sweep, [x] Forged Proof."))
 	} else {
 		for _, entry := range m.log {
 			logLines = append(logLines, stSub.Render("· ")+stInk(entry))
@@ -715,13 +1054,12 @@ func (m *Model) View() tea.View {
 	}
 	logBox := cardBox(logLines, inner, false)
 
-	// Footer key legend (cherry-pi style)
 	keys := []string{
-		stPurple.Render("1-3/↑↓") + " " + stMuted.Render("statement"),
+		stPurple.Render("1-4/↑↓") + " " + stMuted.Render("statement"),
 		stPurple.Render("tab") + " " + stMuted.Render("toy/advanced"),
-		stCyan.Render("e") + " " + stMuted.Render("encrypt"),
-		stGreen.Render("d") + " " + stMuted.Render("decrypt w1"),
-		stGreen.Render("w") + " " + stMuted.Render("alt witness w2"),
+		stCyan.Render("e") + " " + stMuted.Render("lock/encrypt"),
+		stGreen.Render("d") + " " + stMuted.Render("prove w1"),
+		stGreen.Render("w") + " " + stMuted.Render("alt w2"),
 		stRed.Render("x") + " " + stMuted.Render("tamper"),
 		stYellow.Render("c") + " " + stMuted.Render("compare"),
 		stMuted.Render("q quit"),
@@ -755,7 +1093,6 @@ func kvRow(k, v string, width int) string {
 	return keyPart + stSub.Render(ansi.Truncate(v, rem, "…"))
 }
 
-// renderSearchBar visualizes [-3*sigma, +3*sigma] around center c_w and marks where t landed.
 func renderSearchBar(offset *big.Int, N int, g int64, width int) string {
 	barW := max(24, width-18)
 	mid := barW / 2
@@ -787,6 +1124,8 @@ func renderSearchBar(offset *big.Int, N int, g int64, width int) string {
 
 // Run launches the interactive Praxis TUI in the terminal.
 func Run(startAdvanced bool) error {
-	_, err := tea.NewProgram(New(startAdvanced)).Run()
+	m := New(startAdvanced)
+	defer m.cleanup()
+	_, err := tea.NewProgram(m).Run()
 	return err
 }

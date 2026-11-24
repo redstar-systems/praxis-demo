@@ -71,4 +71,11 @@ func TestTUIWorkflowToyAndAdvanced(t *testing.T) {
 	if m.cmp == nil || m.cmp.advTable >= m.cmp.toyTable {
 		t.Fatalf("expected compact fingerprint table in comparison: %+v", m.cmp)
 	}
+
+	// Switch to Signet Bridge Vault tab (4) and verify Signet vault panel renders.
+	m = sendKey(m, "4")
+	v4 := m.View()
+	if !strings.Contains(v4.Content, "BITCOIN PRIVATE SIGNET") {
+		t.Fatal("expected BITCOIN PRIVATE SIGNET section on tab 4")
+	}
 }

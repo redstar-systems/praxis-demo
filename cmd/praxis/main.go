@@ -1,10 +1,13 @@
 // Command praxis encrypts a message to a puzzle and decrypts it with the
-// puzzle's solution. It is a demonstration and is not secure.
+// puzzle's solution, including an operator-free 2-of-2 Bitcoin Private Signet
+// Taproot vault bridge demo. It is a demonstration and is not secure.
 package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,13 +19,20 @@ import (
 
 	"praxis-demo/bqs"
 	"praxis-demo/praxis"
+	"praxis-demo/signet"
 	"praxis-demo/tui"
 )
 
 const usage = `praxis: witness encryption demo. NOT SECURE; do not protect anything with it.
 
   praxis tui [--toy]
-      Open the interactive Charm TUI workbench (Toy & Advanced modes).
+      Open the interactive Charm TUI workbench (Toy & Advanced modes + Signet Bridge).
+
+  praxis bridge [--toy] [--rpc 127.0.0.1:PORT --cookie PATH]
+      Execute an end-to-end operator-free 2-of-2 Bitcoin Private Signet Taproot vault:
+      fund 2-of-2 tr(NUMS, multi_a(2, Dep, Clm)) -> verify neither live key can spend alone
+      -> Praxis-encrypt Depositor's 1-of-2 PSBT -> reject forged burn proof -> prove L2 burn
+      -> decrypt, co-sign with Claimer, finalize OP_CHECKSIGADD, broadcast & mine on Signet.
 
   praxis demo [--advanced | --tui]
       Encrypt to puzzles and decrypt with their solutions.
@@ -101,6 +111,8 @@ func run(args []string) error {
 		return tui.Run(true)
 	case len(args) == 2 && args[0] == "tui" && args[1] == "--toy":
 		return tui.Run(false)
+	case len(args) >= 1 && (args[0] == "bridge" || args[0] == "signet"):
+		return runBridgeCLI(args[1:])
 	case len(args) == 1 && args[0] == "demo":
 		return demo(false)
 	case len(args) == 2 && args[0] == "demo" && args[1] == "--advanced":
@@ -147,6 +159,175 @@ func run(args []string) error {
 	}
 	fmt.Fprint(os.Stderr, usage)
 	return fmt.Errorf("invalid arguments")
+}
+
+func runBridgeCLI(args []string) error {
+	advanced := true
+	var rpcHost, cookiePath string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--toy":
+			advanced = false
+		case "--advanced":
+			advanced = true
+		case "--rpc":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--rpc requires host:port")
+			}
+			i++
+			rpcHost = args[i]
+		case "--cookie":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--cookie requires file path")
+			}
+			i++
+			cookiePath = args[i]
+		default:
+			return fmt.Errorf("unknown bridge flag %q", args[i])
+		}
+	}
+
+	par := praxis.Advanced
+	modeLabel := "ADVANCED (n=24 Serret, 36 cells, J=4/J'=2 chunks, FFT QAP, outward sign-FP64)"
+	if !advanced {
+		par = praxis.Toy
+		modeLabel = "TOY (n=8, 12 cells, J=1/J'=1, schoolbook QAP, growing-interval BSGS)"
+	}
+
+	fmt.Printf("Praxis Operator-Free 2-of-2 Bitcoin Signet Vault Demo — %s\n", modeLabel)
+	fmt.Println("WARNING: Research prototype at demo parameters; NOT constant-time or production-secure.")
+	fmt.Println()
+
+	env, err := signet.ConnectAttachOrStart(rpcHost, cookiePath)
+	if err != nil {
+		return err
+	}
+	defer env.Close()
+
+	st0, err := env.Status()
+	if err != nil {
+		return err
+	}
+	peerNote := ""
+	if st0.PeerRPC != "" && st0.PeerHeight >= 0 {
+		peerNote = fmt.Sprintf(", peer %s @ #%d", st0.PeerRPC, st0.PeerHeight)
+	}
+	fmt.Printf("[1/6] Connected to Private Signet (%s: %s @ #%d%s)\n",
+		st0.Mode, st0.PrimaryRPC, st0.Height, peerNote)
+
+	vault, err := env.LockTaprootVault()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[2/6] Funded 2-of-2 Tapscript Vault — tr(NUMS, multi_a(2, Depositor, Claimer))\n")
+	fmt.Printf("      Vault P2TR:        %s\n", vault.VaultAddress)
+	fmt.Printf("      Deposit OutPoint:  %s (%.8f sBTC, mined in block #%d)\n",
+		vault.OutPoint(), float64(vault.DepositSats)/1e8, vault.DepositBlock)
+	fmt.Printf("      Claimer Recipient: %s (%.8f sBTC, fee %d sats)\n",
+		vault.RecipientAddress, float64(vault.WithdrawSats)/1e8, vault.FeeSats)
+	fmt.Printf("      Key Custody:       BOTH Depositor & Claimer private keys remain LIVE (no key deletion trusted)\n")
+	fmt.Printf("      Depositor 1/2 PSBT:%d bytes (BIP-340 Schnorr share %s...)\n",
+		len(vault.DepositorPartialPSBT), vault.DepositorSigHex[:24])
+
+	depRug, err := env.AttemptUnilateralSpend(vault, "depositor")
+	if err != nil {
+		return err
+	}
+	clmEarly, err := env.AttemptUnilateralSpend(vault, "claimer")
+	if err != nil {
+		return err
+	}
+	if depRug.FinalizableAlone || clmEarly.FinalizableAlone {
+		return fmt.Errorf("unexpected unilateral spend succeeded")
+	}
+	fmt.Printf("[3/6] Verified Live-Key Unilateral Spend Resistance on Bitcoin Core\n")
+	fmt.Printf("      Depositor rug-pull (live key): 1-of-2 signed=%v, finalizable alone=%v -> BLOCKED\n",
+		depRug.PartialSigned, depRug.FinalizableAlone)
+	fmt.Printf("      Claimer early take (live key): 1-of-2 signed=%v, finalizable alone=%v -> BLOCKED\n",
+		clmEarly.PartialSigned, clmEarly.FinalizableAlone)
+
+	ctx := bqs.BridgeContext{
+		VaultOutPoint:    vault.OutPoint(),
+		RecipientAddress: vault.RecipientAddress,
+		AmountSats:       vault.WithdrawSats,
+	}
+	var secrets [bqs.BridgeBatchSlots][16]byte
+	for i := range secrets {
+		if _, err := rand.Read(secrets[i][:]); err != nil {
+			return err
+		}
+	}
+	var batch [bqs.BridgeBatchSlots]bqs.BridgeNoteCommitment
+	for i := range batch {
+		batch[i] = bqs.CommitBridgeBurn(ctx, secrets[i])
+	}
+	rawSys, err := bqs.BridgeBurn(ctx, batch)
+	if err != nil {
+		return err
+	}
+	pp, err := praxis.Setup(par, rawSys.PadConstraints(par.JRem()))
+	if err != nil {
+		return err
+	}
+	ct, encRep, err := praxis.EncDetailed(pp, vault.DepositorPartialPSBT)
+	for i := range vault.DepositorPartialPSBT {
+		vault.DepositorPartialPSBT[i] = 0
+	}
+	vault.DepositorPartialPSBT = nil
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[4/6] Sealed Depositor's 1-of-2 Partial PSBT inside Praxis Ciphertext (Depositor now offline)\n")
+	fmt.Printf("      BQS Statement:     N=%d unknowns, nc=%d equations, nu=%d cosets (|H|=%d)\n",
+		pp.S.N, len(pp.S.Constraints), pp.Nu, pp.SubgroupSize)
+	fmt.Printf("      Ciphertext:        %d bytes (%d G1 + %d G2, chunks J=%d/%d, J'=%d/%d) in %v\n",
+		encRep.Bytes, encRep.G1, encRep.G2, encRep.J, encRep.Delta, encRep.JPrime, encRep.DeltaP,
+		encRep.EncDur.Round(time.Millisecond))
+
+	// Attack with forged burn proof before legitimate withdrawal.
+	w1, err := bqs.BridgeBurnWitness(1, secrets[1])
+	if err != nil {
+		return err
+	}
+	forged := append([]bool(nil), w1...)
+	forged[5] = !forged[5]
+	badOut, badRep, badErr := praxis.DecUncheckedDetailed(pp, ct, forged)
+	unspentAfterAttack, err := env.IsOutPointUnspent(vault.DepositTxID, vault.DepositVout)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[5/6] Forged Burn-Proof Attack (1 bit flipped in DecUnchecked)\n")
+	fmt.Printf("      Praxis Result:     %s (exact QAP=%v, %v)\n",
+		describe(badOut, badErr), badRep.ExactQAP, badRep.TotalDur.Round(time.Millisecond))
+	fmt.Printf("      Signet UTXO:       unspent = %v (1.00000000 sBTC remains locked in 2-of-2)\n", unspentAfterAttack)
+
+	// Prove valid L2 burn slot #1 -> decrypt Depositor's 1/2 PSBT -> Claimer co-signs & sweeps.
+	recoveredPSBT, decRep, err := praxis.DecDetailed(pp, ct, w1)
+	if err != nil {
+		return fmt.Errorf("valid burn proof decryption failed: %w", err)
+	}
+	settle, err := env.CoSignAndSweep(vault, recoveredPSBT)
+	if err != nil {
+		return err
+	}
+	peerConfirm := ""
+	if settle.PeerBlockHeight >= 0 {
+		peerConfirm = fmt.Sprintf(" (peer synced=%v @ #%d)", settle.PeerSynced, settle.PeerBlockHeight)
+	}
+	fmt.Printf("[6/6] Valid L2 Burn Proof (Slot #1, secret %s…) -> Co-Signed & Settled\n",
+		hex.EncodeToString(secrets[1][:])[:16])
+	fmt.Printf("      Praxis Decrypt:    %v (%d pairings, %s baby=%d giant=%d, offset t=%s)\n",
+		decRep.TotalDur.Round(time.Millisecond), decRep.Pairings, decRep.Search.Algorithm,
+		decRep.Search.BabySteps, decRep.Search.GiantSteps, decRep.Search.Offset.String())
+	fmt.Printf("      Claimer Co-Sign:   OP_CHECKSIGADD finalized (%d witness items, %d B tx, Depositor offline)\n",
+		settle.WitnessItems, settle.TxBytes)
+	fmt.Printf("      Broadcast TxID:    %s (matches expected=%v)\n",
+		settle.SweepTxID, settle.SweepTxID == vault.ExpectedSweepTxID)
+	fmt.Printf("      Confirmed Block:   #%d (%s)%s\n",
+		settle.BlockHeight, settle.BlockHash, peerConfirm)
+	fmt.Printf("      Final Balances:    Vault UTXO spent = %v | Claimer %s = %.8f sBTC\n",
+		settle.VaultSpent, vault.RecipientAddress, float64(settle.RecipientSats)/1e8)
+	return nil
 }
 
 func encrypt(p puzzle, msg, file string) error {
