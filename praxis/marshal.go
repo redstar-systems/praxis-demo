@@ -12,7 +12,7 @@ import (
 
 const (
 	magic       = "praxis-demo ciphertext 1\n"
-	maxFieldLen = 1 << 26
+	maxFieldLen = 1 << 29 // supports up to Table-4 N=391,693 (150.8M G1 elements, ~8 GiB on disk)
 )
 
 type countingWriter struct {
