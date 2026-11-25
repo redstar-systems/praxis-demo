@@ -215,33 +215,42 @@ func TestBN254Groth16VerifierBQSRealProof(t *testing.T) {
 		nu *= 2
 	}
 
-	// Exact baseline metrics (pre-optimization 4x68-bit unbatched compiler):
-	//   N=3,064,950 | nc=13,884 | Fmax=154 (nu=256) | compile~2135ms | synth~2175ms | check~426ms
+	// Exact baseline metrics:
+	//   v0.3.1 (4x68-bit, no G2[r] check): N=3,064,950 | nc=13,884 | Fmax=154 (nu=256) | D=6,619,256
+	//   v0.3.2 (5x54-bit, no G2[r] check): N=2,379,749 | nc=11,301 | Fmax=60  (nu=64)  | D=3,103,015
 	const (
-		baseN    = 3064950
-		baseNC   = 13884
-		baseFmax = 154
-		baseNu   = 256
+		v031N    = 3064950
+		v031NC   = 13884
+		v031Fmax = 154
+		v031Nu   = 256
+		v032N    = 2379749
+		v032NC   = 11301
+		v032Fmax = 60
+		v032Nu   = 64
 	)
-	t.Logf("BN254 GROTH16 BQS BEFORE: N=%d | nc=%d | Fmax=%d (nu=%d) | D=%d | compile~2135ms | synth~2175ms | check~426ms",
-		baseN, baseNC, baseFmax, baseNu, baseN+2+baseNu*baseNC)
-	t.Logf("BN254 GROTH16 BQS AFTER:  N=%d (-%.1f%%) | nc=%d (-%.1f%%) | Fmax=%d (-%.1f%%, nu=%d) | D=%d (-%.1f%%) | compile=%v | synth=%v | check=%v",
-		encSys.N, 100*float64(baseN-encSys.N)/float64(baseN),
-		len(encSys.Constraints), 100*float64(baseNC-len(encSys.Constraints))/float64(baseNC),
-		fmax, 100*float64(baseFmax-fmax)/float64(baseFmax), nu,
-		encSys.N+2+nu*len(encSys.Constraints),
-		100*float64((baseN+2+baseNu*baseNC)-(encSys.N+2+nu*len(encSys.Constraints)))/float64(baseN+2+baseNu*baseNC),
+	gotD := encSys.N + 2 + nu*len(encSys.Constraints)
+	v031D := v031N + 2 + v031Nu*v031NC
+	v032D := v032N + 2 + v032Nu*v032NC
+	t.Logf("BN254 GROTH16 BQS v0.3.1 (no G2[r]): N=%d | nc=%d | Fmax=%d (nu=%d) | D=%d | compile~2135ms | synth~2175ms | check~426ms",
+		v031N, v031NC, v031Fmax, v031Nu, v031D)
+	t.Logf("BN254 GROTH16 BQS v0.3.2 (no G2[r]): N=%d | nc=%d | Fmax=%d (nu=%d) | D=%d | compile~424ms  | synth~537ms  | check~336ms",
+		v032N, v032NC, v032Fmax, v032Nu, v032D)
+	t.Logf("BN254 GROTH16 BQS +G2[r] SUBGROUP:   N=%d (+%d / +%.2f%% vs v0.3.2, -%.1f%% vs v0.3.1) | nc=%d (+%d / +%.2f%% vs v0.3.2) | Fmax=%d (nu=%d) | D=%d (+%d vs v0.3.2, -%.1f%% vs v0.3.1) | compile=%v | synth=%v | check=%v",
+		encSys.N, encSys.N-v032N, 100*float64(encSys.N-v032N)/float64(v032N), 100*float64(v031N-encSys.N)/float64(v031N),
+		len(encSys.Constraints), len(encSys.Constraints)-v032NC, 100*float64(len(encSys.Constraints)-v032NC)/float64(v032NC),
+		fmax, nu,
+		gotD, gotD-v032D, 100*float64(v031D-gotD)/float64(v031D),
 		compileDur.Round(time.Millisecond), synthDur.Round(time.Millisecond), checkDur.Round(time.Millisecond))
 
-	// Regression guardrails confirming concrete reductions.
-	if encSys.N >= 2500000 {
-		t.Fatalf("expected optimized N < 2,500,000, got %d", encSys.N)
+	// Regression guardrails confirming compact G2[r] subgroup overhead (<2% vs v0.3.2, nu=64 preserved).
+	if encSys.N >= 2450000 {
+		t.Fatalf("expected subgroup-checked N < 2,450,000, got %d", encSys.N)
 	}
-	if len(encSys.Constraints) >= 12000 {
-		t.Fatalf("expected optimized nc < 12,000, got %d", len(encSys.Constraints))
+	if len(encSys.Constraints) >= 11500 {
+		t.Fatalf("expected subgroup-checked nc < 11,500, got %d", len(encSys.Constraints))
 	}
 	if fmax > 63 {
-		t.Fatalf("expected optimized Fmax <= 63 (nu=64), got %d", fmax)
+		t.Fatalf("expected subgroup-checked Fmax <= 63 (nu=64), got %d", fmax)
 	}
 
 	// 4. Verify a second distinct valid proof (different Ar/Bs/Krs randomizers for the SAME vk & pubKsum)
@@ -345,4 +354,223 @@ func TestBN254Groth16VerifierBQSRealProof(t *testing.T) {
 			t.Fatalf("SECURITY FAILURE: 1-bit flip at %s (w[%d]) satisfied Groth16 verifier BQS!", tc.name, tc.idx)
 		}
 	}
+}
+
+// g2ScalarMulNaive performs exact double-and-add on E'(F_{p^2}) without GLS shortcuts
+// so cofactor points outside G2[r] are handled accurately in adversarial tests.
+func g2ScalarMulNaive(q *bn254.G2Affine, s *big.Int) bn254.G2Affine {
+	var res, base bn254.G2Jac
+	base.FromAffine(q)
+	for i := s.BitLen() - 1; i >= 0; i-- {
+		res.DoubleAssign()
+		if s.Bit(i) == 1 {
+			res.AddAssign(&base)
+		}
+	}
+	var out bn254.G2Affine
+	out.FromJacobian(&res)
+	return out
+}
+
+// buildG2SubgroupGadgetBQS isolates the exact G2 twist + [6x+2]Q + psi(Q) - psi^2(Q) == -psi^3(Q)
+// + 23-factor batched chord non-zero denominator BQS gadget used inside buildGroth16BQS.
+func buildG2SubgroupGadgetBQS(q *bn254.G2Affine) (*System, []bool, error) {
+	synth := q != nil
+	b := NewFpBuilder(synth)
+	var hostBs bn254.G2Affine
+	if synth {
+		hostBs = *q
+	}
+	bs := b.NewG2Var(hostBs)
+	b.AssertG2OnTwist(bs)
+
+	hostAccQ := hostBs
+	accQ := bs
+	var denomProd E2Var
+	hasDenomProd := false
+	addNonZeroDenom := func(aX, bX E2Var) {
+		if !hasDenomProd {
+			denomProd = b.E2Sub(aX, bX)
+			hasDenomProd = true
+		} else {
+			denomProd = b.E2MulDiff(denomProd, aX, bX)
+		}
+	}
+
+	for i := len(bn254.LoopCounter) - 2; i >= 0; i-- {
+		bit := bn254.LoopCounter[i]
+		switch bit {
+		case 0:
+			accQ, _, _ = g2DoubleStepBQS(b, accQ, &hostAccQ)
+		case 1, -1:
+			addNonZeroDenom(accQ.X, bs.X)
+			accQ, _, _, _, _ = g2DoubleAndAddStepBQS(b, accQ, bs, bit == -1, &hostAccQ, hostBs)
+		}
+	}
+
+	phiBs := G2Var{
+		X: b.E2LinearMap(bs.X, g2PhiXMat),
+		Y: b.E2LinearMap(bs.Y, g2PhiYMat),
+	}
+	psiBs := G2Var{
+		X: b.E2LinearMap(bs.X, g2PsiXMat),
+		Y: b.E2LinearMap(bs.Y, g2PsiYMat),
+	}
+	negPsi3Bs := G2Var{
+		X: b.E2LinearMap(bs.X, g2NegPsi3XMat),
+		Y: phiBs.Y,
+	}
+	var hostPhiBs, hostPsiBs bn254.G2Affine
+	if synth {
+		hostPhiBs.X.Conjugate(&hostBs.X).MulByNonResidue1Power2(&hostPhiBs.X)
+		hostPhiBs.Y.Conjugate(&hostBs.Y).MulByNonResidue1Power3(&hostPhiBs.Y)
+		hostPsiBs.X.MulByNonResidue2Power2(&hostBs.X)
+		hostPsiBs.Y.MulByNonResidue2Power3(&hostBs.Y).Neg(&hostPsiBs.Y)
+	}
+	addNonZeroDenom(phiBs.X, accQ.X)
+	accQ, _, _ = g2AddStepBQS(b, accQ, phiBs, &hostAccQ, hostPhiBs)
+
+	addNonZeroDenom(psiBs.X, accQ.X)
+	b.E2AssertNonZero(denomProd)
+	_, _ = g2AddToTargetBQS(b, accQ, psiBs, negPsi3Bs, hostAccQ, hostPsiBs)
+
+	sys, err := b.System()
+	if err != nil {
+		return nil, nil, err
+	}
+	return sys, b.W, nil
+}
+
+// TestBN254Groth16G2SubgroupAttackRejection constructs real non-subgroup twist points
+// Q_bad in E'(F_{p^2}) \ G2[r] (both large-cofactor and small order-10069 cofactor points)
+// that pass y^2 = x^3 + b' but fail IsInSubGroup(), and proves:
+//  1. Twist-only curve constraints accept Q_bad and Q_10069 (demonstrating the attack surface).
+//  2. SynthesizeGroth16Witness rejects both Q_bad and Q_10069.
+//  3. Splicing Q_bad or Q_10069 into a valid witness fails encSys.IsWitness.
+//  4. The isolated in-BQS G2[r] Frobenius + batched-denominator gadget accepts valid G2[r]
+//     points and makes both Q_bad and Q_10069 unsatisfiable directly at the BQS constraint level.
+func TestBN254Groth16G2SubgroupAttackRejection(t *testing.T) {
+	_, _, _, g2Gen := bn254.Generators()
+
+	// Construct Q_bad in E'(F_{p^2}) \ G2[r] via gnark-crypto's cofactor-only generator.
+	var seedE2 bn254.E2
+	seedE2.A0.SetUint64(7)
+	seedE2.A1.SetUint64(13)
+	qBadJac := bn254.GeneratePointNotInG2(seedE2)
+	var qBad bn254.G2Affine
+	qBad.FromJacobian(&qBadJac)
+	if !qBad.IsOnCurve() || qBad.IsInfinity() || qBad.IsInSubGroup() {
+		t.Fatalf("expected Q_bad on twist outside G2[r]: onCurve=%v inf=%v inSubGroup=%v",
+			qBad.IsOnCurve(), qBad.IsInfinity(), qBad.IsInSubGroup())
+	}
+
+	// Construct a real small-order twist point Q_10069 of exact prime order 10069 | h2 = 2p - r.
+	h2 := new(big.Int).Sub(new(big.Int).Lsh(bn254P, 1), bn254Q)
+	smallOrder := big.NewInt(10069)
+	if new(big.Int).Mod(h2, smallOrder).Sign() != 0 {
+		t.Fatalf("expected 10069 | h2")
+	}
+	q10069 := g2ScalarMulNaive(&qBad, new(big.Int).Div(h2, smallOrder))
+	if !q10069.IsOnCurve() || q10069.IsInfinity() || q10069.IsInSubGroup() {
+		t.Fatalf("expected Q_10069 on twist outside G2[r]: onCurve=%v inf=%v inSubGroup=%v",
+			q10069.IsOnCurve(), q10069.IsInfinity(), q10069.IsInSubGroup())
+	}
+	if checkInf := g2ScalarMulNaive(&q10069, smallOrder); !checkInf.IsInfinity() {
+		t.Fatalf("expected [10069]Q_10069 == O")
+	}
+
+	// 1. Confirm twist-curve equation ALONE accepts both Q_bad and Q_10069.
+	for _, tc := range []struct {
+		name string
+		pt   bn254.G2Affine
+	}{{"Q_bad", qBad}, {"Q_10069", q10069}} {
+		fb := NewFpBuilder(true)
+		fb.AssertG2OnTwist(fb.NewG2Var(tc.pt))
+		twistSys, err := fb.System()
+		if err != nil {
+			t.Fatalf("twist-only BQS for %s: %v", tc.name, err)
+		}
+		if !twistSys.IsWitness(fb.W) {
+			t.Fatalf("expected %s to pass twist-only curve check", tc.name)
+		}
+	}
+
+	// 2. Confirm SynthesizeGroth16Witness and compiled encSys reject both Q_bad and Q_10069.
+	vk, pubKsum, proof := makeValidGroth16Instance(1111111, 2222222, 3333333, 4444444, 5555555, 6666666, 7777777)
+	encSys, err := CompileGroth16Verifier(vk, pubKsum)
+	if err != nil {
+		t.Fatalf("CompileGroth16Verifier: %v", err)
+	}
+	_, w, err := SynthesizeGroth16Witness(vk, pubKsum, proof)
+	if err != nil {
+		t.Fatalf("SynthesizeGroth16Witness: %v", err)
+	}
+	if !encSys.IsWitness(w) {
+		t.Fatalf("valid proof witness failed encSys.IsWitness")
+	}
+
+	bsStart := 1 + 4*fpTotalBit // after Ar (2 Fp) and Krs (2 Fp)
+	for _, tc := range []struct {
+		name string
+		pt   bn254.G2Affine
+	}{{"Q_bad", qBad}, {"Q_10069", q10069}} {
+		forged := proof
+		forged.Bs = tc.pt
+		if _, _, err := SynthesizeGroth16Witness(vk, pubKsum, forged); err == nil {
+			t.Fatalf("SECURITY FAILURE: SynthesizeGroth16Witness accepted non-subgroup %s!", tc.name)
+		}
+
+		badW := append([]bool(nil), w...)
+		writeFpBits(badW, bsStart, tc.pt.X.A0.BigInt(new(big.Int)))
+		writeFpBits(badW, bsStart+fpTotalBit, tc.pt.X.A1.BigInt(new(big.Int)))
+		writeFpBits(badW, bsStart+2*fpTotalBit, tc.pt.Y.A0.BigInt(new(big.Int)))
+		writeFpBits(badW, bsStart+3*fpTotalBit, tc.pt.Y.A1.BigInt(new(big.Int)))
+		if encSys.IsWitness(badW) {
+			t.Fatalf("SECURITY FAILURE: spliced non-subgroup %s satisfied encSys!", tc.name)
+		}
+	}
+
+	// 3. Direct constraint-level verification on the isolated G2[r] subgroup gadget
+	// (no host IsInSubGroup short-circuit): valid G2[r] points pass, Q_bad and Q_10069 fail!
+	subEncSys, _, err := buildG2SubgroupGadgetBQS(nil)
+	if err != nil {
+		t.Fatalf("compile G2 subgroup gadget: %v", err)
+	}
+	var validG2 bn254.G2Affine
+	validG2.ScalarMultiplication(&g2Gen, big.NewInt(7777777))
+	for _, validPt := range []bn254.G2Affine{g2Gen, validG2} {
+		_, subW, err := buildG2SubgroupGadgetBQS(&validPt)
+		if err != nil {
+			t.Fatalf("synth G2 subgroup gadget for valid G2[r] point: %v", err)
+		}
+		if !subEncSys.IsWitness(subW) {
+			t.Fatalf("valid G2[r] point failed isolated G2 subgroup BQS")
+		}
+	}
+
+	// Running honest witness synthesis through the BQS gadget on Q_bad or Q_10069 MUST panic
+	// inside AssertQuadModP / E2AssertNonZero (proving direct constraint unsatisfiability!).
+	for _, tc := range []struct {
+		name string
+		pt   bn254.G2Affine
+	}{{"Q_bad", qBad}, {"Q_10069", q10069}} {
+		rejected := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					rejected = true
+					t.Logf("G2[r] BQS constraint directly rejected %s: %v", tc.name, r)
+				}
+			}()
+			_, subBadW, err := buildG2SubgroupGadgetBQS(&tc.pt)
+			if err != nil || !subEncSys.IsWitness(subBadW) {
+				rejected = true
+			}
+		}()
+		if !rejected {
+			t.Fatalf("SECURITY FAILURE: non-subgroup %s satisfied isolated G2[r] BQS gadget!", tc.name)
+		}
+	}
+	t.Logf("BN254 G2[r] SUBGROUP GADGET PASS: N=%d nc=%d Fmax=%d (valid G2[r] accepted; Q_bad & Q_10069 rejected)",
+		subEncSys.N, len(subEncSys.Constraints), subEncSys.Fmax())
 }

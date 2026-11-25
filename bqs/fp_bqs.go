@@ -85,11 +85,13 @@ var (
 	e12Frob3Mat [12][12]*big.Int
 	// e12MulCoeffs[outCoord][i][j] is the small integer multiplier for a[i]*b[j] in (a*b)[outCoord].
 	e12MulCoeffs [12][12][12]int64
-	// g2PhiMat / g2PsiMat: exact F_p 2x2 matrices for E2 Frobenius maps used in final Miller lines.
-	g2PhiXMat [2][2]*big.Int
-	g2PhiYMat [2][2]*big.Int
-	g2PsiXMat [2][2]*big.Int
-	g2PsiYMat [2][2]*big.Int
+	// g2PhiMat / g2PsiMat / g2NegPsi3XMat: exact F_p 2x2 matrices for E2 Frobenius maps used in final Miller lines
+	// and the in-BQS G2[r] prime-order subgroup check ([6x+2]Q + psi(Q) - psi^2(Q) == -psi^3(Q)).
+	g2PhiXMat     [2][2]*big.Int
+	g2PhiYMat     [2][2]*big.Int
+	g2PsiXMat     [2][2]*big.Int
+	g2PsiYMat     [2][2]*big.Int
+	g2NegPsi3XMat [2][2]*big.Int
 )
 
 func init() {
@@ -110,6 +112,60 @@ func init() {
 	neg3 := new(big.Int).Sub(bn254P, big.NewInt(3))
 	if new(big.Int).Exp(neg3, exp3, bn254P).Cmp(bn254BigOne) == 0 {
 		panic("bqs fp init: expected -3 to be a cubic non-residue mod p")
+	}
+	// 4. Exact BN254 G2[r] prime-order subgroup endomorphism soundness assertion:
+	// On the sextic twist E'(F_{p^2}), #E'(F_{p^2}) = r * h2 where h2 = 2p - r is odd (ruling out y == 0
+	// on E'(F_{p^2})), and Frobenius psi satisfies psi^2 - t*psi + p = 0 (t = p + 1 - r) on ALL of E'(F_{p^2}).
+	// For Phi_Ate(psi) = (6x+2) + psi - psi^2 + psi^3 reduced mod (psi^2 - t*psi + p) to a + b*psi,
+	// asserting gcd(Norm(Phi_Ate), #E'(F_{p^2})) == r proves Phi_Ate(Q) == O <=> Q in G2[r].
+	{
+		tTrace := new(big.Int).Add(bn254P, bn254BigOne)
+		tTrace.Sub(tTrace, bn254Q)
+		h2 := new(big.Int).Sub(new(big.Int).Lsh(bn254P, 1), bn254Q)
+		orderE2 := new(big.Int).Mul(bn254Q, h2)
+		if orderE2.Bit(0) != 1 {
+			panic("bqs fp init: expected #E'(F_{p^2}) to be odd")
+		}
+		sixX2 := big.NewInt(int64(bn254.LoopCounter[len(bn254.LoopCounter)-1]))
+		pModR := new(big.Int).Mod(bn254P, bn254Q)
+		negOneModR := new(big.Int).Sub(bn254Q, bn254BigOne)
+		for i := len(bn254.LoopCounter) - 2; i >= 0; i-- {
+			bit := bn254.LoopCounter[i]
+			if bit != 0 {
+				m := new(big.Int).Mod(sixX2, bn254Q)
+				if m.Cmp(bn254BigOne) == 0 || m.Cmp(negOneModR) == 0 {
+					panic("bqs fp init: unexpected Miller loop chord exception mod r")
+				}
+			}
+			sixX2.Lsh(sixX2, 1)
+			sixX2.Add(sixX2, big.NewInt(int64(bit)))
+		}
+		// Phi_Ate(psi) = sixX2 + psi - (t*psi - p) + ((t^2 - p)*psi - t*p)
+		//              = (sixX2 + p - t*p) + (1 - t + t^2 - p)*psi
+		t2 := new(big.Int).Mul(tTrace, tTrace)
+		a := new(big.Int).Add(sixX2, bn254P)
+		a.Sub(a, new(big.Int).Mul(tTrace, bn254P))
+		bCoef := new(big.Int).Sub(bn254BigOne, tTrace)
+		bCoef.Add(bCoef, t2)
+		bCoef.Sub(bCoef, bn254P)
+		norm := new(big.Int).Mul(a, a)
+		norm.Add(norm, new(big.Int).Mul(new(big.Int).Mul(a, bCoef), tTrace))
+		norm.Add(norm, new(big.Int).Mul(new(big.Int).Mul(bCoef, bCoef), bn254P))
+		if new(big.Int).GCD(nil, nil, norm, orderE2).Cmp(bn254Q) != 0 {
+			panic("bqs fp init: gcd(Norm(Phi_Ate), #E'(F_{p^2})) != r")
+		}
+		// Verify Frobenius chord steps have zero exceptional cases for all Q in G2[r] \ {O}.
+		accModR := new(big.Int).Mod(sixX2, bn254Q)
+		negPModR := new(big.Int).Sub(bn254Q, pModR)
+		if accModR.Cmp(pModR) == 0 || accModR.Cmp(negPModR) == 0 {
+			panic("bqs fp init: unexpected Frobenius step 1 chord exception mod r")
+		}
+		acc1 := new(big.Int).Mod(new(big.Int).Add(accModR, pModR), bn254Q)
+		p2ModR := new(big.Int).Mod(new(big.Int).Mul(pModR, pModR), bn254Q)
+		negP2ModR := new(big.Int).Sub(bn254Q, p2ModR)
+		if acc1.Cmp(p2ModR) == 0 || acc1.Cmp(negP2ModR) == 0 {
+			panic("bqs fp init: unexpected Frobenius step 2 chord exception mod r")
+		}
 	}
 
 	var pow2, two fr.Element
@@ -210,7 +266,7 @@ func init() {
 		}
 	}
 
-	// Extract exact G2 Frobenius Q1 = phi(Q) and Q2 = -psi(Q) 2x2 matrices over F_p.
+	// Extract exact G2 Frobenius Q1 = psi(Q), Q2 = -psi^2(Q), and Q3 = -psi^3(Q) = psi(Q2) 2x2 matrices over F_p.
 	for col := 0; col < 2; col++ {
 		var e bn254.E2
 		if col == 0 {
@@ -218,11 +274,16 @@ func init() {
 		} else {
 			e.A1.SetOne()
 		}
-		var px, py, sx, sy bn254.E2
+		var px, py, sx, sy, q3x, q3y bn254.E2
 		px.Conjugate(&e).MulByNonResidue1Power2(&px)
 		py.Conjugate(&e).MulByNonResidue1Power3(&py)
 		sx.MulByNonResidue2Power2(&e)
 		sy.MulByNonResidue2Power3(&e).Neg(&sy)
+		q3x.Conjugate(&sx).MulByNonResidue1Power2(&q3x)
+		q3y.Conjugate(&sy).MulByNonResidue1Power3(&q3y)
+		if !q3y.Equal(&py) {
+			panic("bqs fp init: expected (-psi^3(Q)).Y == psi(Q).Y")
+		}
 
 		g2PhiXMat[0][col] = px.A0.BigInt(new(big.Int))
 		g2PhiXMat[1][col] = px.A1.BigInt(new(big.Int))
@@ -232,6 +293,8 @@ func init() {
 		g2PsiXMat[1][col] = sx.A1.BigInt(new(big.Int))
 		g2PsiYMat[0][col] = sy.A0.BigInt(new(big.Int))
 		g2PsiYMat[1][col] = sy.A1.BigInt(new(big.Int))
+		g2NegPsi3XMat[0][col] = q3x.A0.BigInt(new(big.Int))
+		g2NegPsi3XMat[1][col] = q3x.A1.BigInt(new(big.Int))
 	}
 }
 
@@ -1574,6 +1637,76 @@ func (b *FpBuilder) E2MulByFp(x E2Var, s FpVar) E2Var {
 func (b *FpBuilder) E2AssertEqual(x, y E2Var) {
 	b.AssertQuadModP(nil, []FpLinTerm{{Coeff: 1, X: x.A0}}, nil, y.A0)
 	b.AssertQuadModP(nil, []FpLinTerm{{Coeff: 1, X: x.A1}}, nil, y.A1)
+}
+
+// E2Sub computes x - y in F_{p^2} using 2 linear CRT(2^162, q) constraints per coordinate.
+func (b *FpBuilder) E2Sub(x, y E2Var) E2Var {
+	var outVal bn254.E2
+	if b.synth {
+		var ex, ey bn254.E2
+		ex.A0.SetBigInt(x.A0.Val)
+		ex.A1.SetBigInt(x.A1.Val)
+		ey.A0.SetBigInt(y.A0.Val)
+		ey.A1.SetBigInt(y.A1.Val)
+		outVal.Sub(&ex, &ey)
+	}
+	out := b.NewE2Var(outVal)
+	b.AssertQuadModP(nil, []FpLinTerm{{Coeff: 1, X: x.A0}, {Coeff: -1, X: y.A0}}, nil, out.A0)
+	b.AssertQuadModP(nil, []FpLinTerm{{Coeff: 1, X: x.A1}, {Coeff: -1, X: y.A1}}, nil, out.A1)
+	return out
+}
+
+// E2MulDiff computes x * (a - b) in F_{p^2} in 2 F_p constraints without materializing a - b.
+func (b *FpBuilder) E2MulDiff(x, a, bv E2Var) E2Var {
+	var outVal bn254.E2
+	if b.synth {
+		var ex, ea, eb, diff bn254.E2
+		ex.A0.SetBigInt(x.A0.Val)
+		ex.A1.SetBigInt(x.A1.Val)
+		ea.A0.SetBigInt(a.A0.Val)
+		ea.A1.SetBigInt(a.A1.Val)
+		eb.A0.SetBigInt(bv.A0.Val)
+		eb.A1.SetBigInt(bv.A1.Val)
+		diff.Sub(&ea, &eb)
+		outVal.Mul(&ex, &diff)
+	}
+	out := b.NewE2Var(outVal)
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: x.A0, B: a.A0},
+		{Coeff: -1, A: x.A0, B: bv.A0},
+		{Coeff: -1, A: x.A1, B: a.A1},
+		{Coeff: 1, A: x.A1, B: bv.A1},
+	}, nil, nil, out.A0)
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: x.A0, B: a.A1},
+		{Coeff: -1, A: x.A0, B: bv.A1},
+		{Coeff: 1, A: x.A1, B: a.A0},
+		{Coeff: -1, A: x.A1, B: bv.A0},
+	}, nil, nil, out.A1)
+	return out
+}
+
+// E2AssertNonZero proves x != 0 in F_{p^2} by witnessing x * inv == 1 (mod p^2).
+func (b *FpBuilder) E2AssertNonZero(x E2Var) {
+	var invVal bn254.E2
+	if b.synth {
+		var ex bn254.E2
+		ex.A0.SetBigInt(x.A0.Val)
+		ex.A1.SetBigInt(x.A1.Val)
+		if ex.IsZero() {
+			panic("bqs E2AssertNonZero: zero input")
+		}
+		invVal.Inverse(&ex)
+	}
+	inv := b.NewE2Var(invVal)
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: x.A0, B: inv.A0},
+		{Coeff: -1, A: x.A1, B: inv.A1},
+	}, nil, nil, b.oneFp)
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: x.A0, B: inv.A1},
+		{Coeff: 1, A: x.A1, B: inv.A0},
+	}, nil, nil, b.zeroFp)
 }
 
 func (b *FpBuilder) E2LinearMap(x E2Var, mat [2][2]*big.Int) E2Var {

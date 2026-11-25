@@ -239,9 +239,11 @@ func g2AddStepBQS(b *FpBuilder, accQ, a G2Var, hostQ *bn254.G2Affine, hostA bn25
 	return G2Var{X: xr, Y: yr}, lam, hostLam
 }
 
-// g2AddSlopeOnlyBQS computes only the chord slope lam between accQ and a in 2 F_p constraints
-// (used on the final Frobenius step where the resulting point accQ + psi(Bs) is never needed).
-func g2AddSlopeOnlyBQS(b *FpBuilder, accQ, a G2Var, hostQ, hostA bn254.G2Affine) (E2Var, bn254.E2) {
+// g2AddToTargetBQS enforces accQ + a == target in E'(F_{p^2}) (given caller proves a.X != accQ.X
+// via the batched chord denominator non-zero product) and returns the chord slope lam in 6 F_p constraints.
+// Used on the final Frobenius step to simultaneously produce the lPsi Miller line slope and prove the
+// exact BN254 G2[r] prime-order subgroup identity [6x+2]Bs + psi(Bs) - psi^2(Bs) == -psi^3(Bs).
+func g2AddToTargetBQS(b *FpBuilder, accQ, a, target G2Var, hostQ, hostA bn254.G2Affine) (E2Var, bn254.E2) {
 	var hostLam bn254.E2
 	if b.synth {
 		var n, d bn254.E2
@@ -251,6 +253,7 @@ func g2AddSlopeOnlyBQS(b *FpBuilder, accQ, a G2Var, hostQ, hostA bn254.G2Affine)
 	}
 	lam := b.NewE2Var(hostLam)
 
+	// 1. lam * (a.X - accQ.X) == a.Y - accQ.Y
 	b.AssertQuadModP([]FpQuadTerm{
 		{Coeff: 1, A: lam.A0, B: a.X.A0},
 		{Coeff: -1, A: lam.A1, B: a.X.A1},
@@ -263,6 +266,29 @@ func g2AddSlopeOnlyBQS(b *FpBuilder, accQ, a G2Var, hostQ, hostA bn254.G2Affine)
 		{Coeff: -1, A: lam.A0, B: accQ.X.A1},
 		{Coeff: -1, A: lam.A1, B: accQ.X.A0},
 	}, []FpLinTerm{{Coeff: 1, X: accQ.Y.A1}}, nil, a.Y.A1)
+
+	// 2. target.X == lam^2 - accQ.X - a.X
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: lam.A0, B: lam.A0},
+		{Coeff: -1, A: lam.A1, B: lam.A1},
+	}, []FpLinTerm{{Coeff: -1, X: accQ.X.A0}, {Coeff: -1, X: a.X.A0}}, nil, target.X.A0)
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 2, A: lam.A0, B: lam.A1},
+	}, []FpLinTerm{{Coeff: -1, X: accQ.X.A1}, {Coeff: -1, X: a.X.A1}}, nil, target.X.A1)
+
+	// 3. target.Y == lam * (accQ.X - target.X) - accQ.Y
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: lam.A0, B: accQ.X.A0},
+		{Coeff: -1, A: lam.A1, B: accQ.X.A1},
+		{Coeff: -1, A: lam.A0, B: target.X.A0},
+		{Coeff: 1, A: lam.A1, B: target.X.A1},
+	}, []FpLinTerm{{Coeff: -1, X: accQ.Y.A0}}, nil, target.Y.A0)
+	b.AssertQuadModP([]FpQuadTerm{
+		{Coeff: 1, A: lam.A0, B: accQ.X.A1},
+		{Coeff: 1, A: lam.A1, B: accQ.X.A0},
+		{Coeff: -1, A: lam.A0, B: target.X.A1},
+		{Coeff: -1, A: lam.A1, B: target.X.A0},
+	}, []FpLinTerm{{Coeff: -1, X: accQ.Y.A1}}, nil, target.Y.A1)
 
 	return lam, hostLam
 }
@@ -427,7 +453,10 @@ func evalConstLinePairProjectiveBQS(
 //
 // Proved statement:
 //   - Ar, Krs lie on BN254 G1 (y^2 = x^3 + 3), implying Ar.X, Ar.Y, Krs.X, Krs.Y != 0 mod p
-//   - Bs lies on BN254 G2 twist (y^2 = x^3 + 3/(9+u))
+//   - Bs lies on BN254 G2 twist (y^2 = x^3 + 3/(9+u)) AND in the prime-order subgroup G2[r] \ {O},
+//     proved via batched non-zero chord denominators across the entire [6x+2]Bs + psi(Bs) - psi^2(Bs)
+//     trajectory together with the exact Frobenius endomorphism check [6x+2]Bs + psi(Bs) - psi^2(Bs) == -psi^3(Bs)
+//     (where gcd(Norm(Phi_Ate), #E'(F_{p^2})) == r is strictly asserted in init())
 //   - e(Ar, Bs) * e(Krs, -delta) * e(Ksum, -gamma) * e(-alpha, beta) == 1 in G_T
 //     verified via Novakovic-Eagen (ePrint 2024/640) folded Miller loop + cubic non-residue
 //     witness w_i in F_{p^6} + non-zero invertibility c * c^{-1} == 1.
@@ -471,6 +500,9 @@ func buildGroth16BQS(vk Groth16VK, publicKsum bn254.G1Affine, proof *Groth16Proo
 		}
 		if proof.Bs.IsInfinity() || !proof.Bs.IsOnCurve() {
 			return nil, nil, fmt.Errorf("invalid Groth16 proof: Bs not on BN254 G2 twist")
+		}
+		if !proof.Bs.IsInSubGroup() {
+			return nil, nil, fmt.Errorf("invalid Groth16 proof: Bs not in BN254 G2[r] prime-order subgroup")
 		}
 		hostAr = proof.Ar
 		hostKrs = proof.Krs
@@ -567,6 +599,20 @@ func buildGroth16BQS(vk Groth16VK, publicKsum bn254.G1Affine, proof *Groth16Proo
 		return b.E2MulByFp(b.ConstE2(l.R0), krsXNegOverY), b.E2MulByFp(b.ConstE2(l.R1), krsYInv)
 	}
 
+	// Accumulate all affine G2 chord denominators (accQ.X - bs.X, phiBs.X - accQ.X, psiBs.X - accQ.X)
+	// into a single F_{p^2} product and enforce denomProd * denomProdInv == 1 so no small-order
+	// cofactor point (e.g. order 10069 dividing h2 = 2p - r) can satisfy lam * 0 == 0.
+	var denomProd E2Var
+	hasDenomProd := false
+	addNonZeroDenom := func(aX, bX E2Var) {
+		if !hasDenomProd {
+			denomProd = b.E2Sub(aX, bX)
+			hasDenomProd = true
+		} else {
+			denomProd = b.E2MulDiff(denomProd, aX, bX)
+		}
+	}
+
 	for i := len(bn254.LoopCounter) - 2; i >= 0; i-- {
 		res = b.E12Square(res)
 		bit := bn254.LoopCounter[i]
@@ -585,6 +631,7 @@ func buildGroth16BQS(vk Groth16VK, publicKsum bn254.G1Affine, proof *Groth16Proo
 			negA := bit == -1
 			prevQ := accQ
 			hostPrevQ := hostAccQ
+			addNonZeroDenom(prevQ.X, bs.X)
 			var l1, l2 E2Var
 			var hostL1, hostL2 bn254.E2
 			accQ, l1, l2, hostL1, hostL2 = g2DoubleAndAddStepBQS(b, accQ, bs, negA, &hostAccQ, hostBs)
@@ -602,7 +649,8 @@ func buildGroth16BQS(vk Groth16VK, publicKsum bn254.G1Affine, proof *Groth16Proo
 		}
 	}
 
-	// Final Frobenius lines: Q1 = phi(Bs) and Q2 = -psi(Bs) (note g2PsiYMat = I_2 -> 0 constraints for psiBs.Y).
+	// Final Frobenius lines: Q1 = psi(Bs), Q2 = -psi^2(Bs), and Q3 = -psi^3(Bs)
+	// (note g2PsiYMat = I_2 -> 0 constraints for psiBs.Y, and (-psi^3(Bs)).Y == psi(Bs).Y -> 0 constraints!).
 	phiBs := G2Var{
 		X: b.E2LinearMap(bs.X, g2PhiXMat),
 		Y: b.E2LinearMap(bs.Y, g2PhiYMat),
@@ -610,6 +658,10 @@ func buildGroth16BQS(vk Groth16VK, publicKsum bn254.G1Affine, proof *Groth16Proo
 	psiBs := G2Var{
 		X: b.E2LinearMap(bs.X, g2PsiXMat),
 		Y: b.E2LinearMap(bs.Y, g2PsiYMat),
+	}
+	negPsi3Bs := G2Var{
+		X: b.E2LinearMap(bs.X, g2NegPsi3XMat),
+		Y: phiBs.Y,
 	}
 	var hostPhiBs, hostPsiBs bn254.G2Affine
 	if synth {
@@ -621,11 +673,15 @@ func buildGroth16BQS(vk Groth16VK, publicKsum bn254.G1Affine, proof *Groth16Proo
 
 	prevQ := accQ
 	hostPrevQ := hostAccQ
+	addNonZeroDenom(phiBs.X, prevQ.X)
 	accQ, lamPhi, hostLamPhi := g2AddStepBQS(b, accQ, phiBs, &hostAccQ, hostPhiBs)
 	c3Phi, c4Phi := evalLineDirectBQS(b, lamPhi, prevQ, ar.X, arXNegOverY, hostLamPhi, hostPrevQ, hostArXNegOverY, hostArYInv)
 
-	// Final chord slope only (the resulting point accQ + psi(Bs) is unused).
-	lamPsi, hostLamPsi := g2AddSlopeOnlyBQS(b, accQ, psiBs, hostAccQ, hostPsiBs)
+	// Final Frobenius chord + exact G2[r] prime-order subgroup check:
+	//   [6x+2]Bs + psi(Bs) - psi^2(Bs) == -psi^3(Bs)   <=>   Phi_Ate(Bs) == O   <=>   Bs in G2[r].
+	addNonZeroDenom(psiBs.X, accQ.X)
+	b.E2AssertNonZero(denomProd)
+	lamPsi, hostLamPsi := g2AddToTargetBQS(b, accQ, psiBs, negPsi3Bs, hostAccQ, hostPsiBs)
 	c3Psi, c4Psi := evalLineDirectBQS(b, lamPsi, accQ, ar.X, arXNegOverY, hostLamPsi, hostAccQ, hostArXNegOverY, hostArYInv)
 
 	bsFrobPair := b.E12Mul034By034Expr(c3Phi, c4Phi, c3Psi, c4Psi)
