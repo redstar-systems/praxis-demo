@@ -35,10 +35,10 @@ const usage = `praxis: witness encryption demo. NOT SECURE; do not protect anyth
       pass --all to include Tier 6: Table 4 n=4608, 6912 cells, g~2^50.6).
 
   praxis bridge [--toy | --tier 1..6] [--admissible] [--rpc 127.0.0.1:PORT --cookie PATH]
-      Execute an end-to-end operator-free 2-of-2 Bitcoin Private Signet Taproot vault:
-      fund 2-of-2 tr(NUMS, multi_a(2, Dep, Clm)) -> verify neither live key can spend alone
-      -> Praxis-encrypt Depositor's 1-of-2 PSBT -> reject forged burn proof -> prove L2 burn
-      -> decrypt, co-sign with Claimer, finalize OP_CHECKSIGADD, broadcast & mine on Signet.
+      Execute an end-to-end operator-free 2-of-2 + CSV Bitcoin Private Signet Taproot vault:
+      fund tr(NUMS, {multi_a(2, Dep, Clm), and_v(v:pk(Dep_refund), older(6))}) -> verify live-key
+      rug-pull, premature claim, and early CSV refund all fail -> Praxis-encrypt 1-of-2 PSBT ->
+      reject forged burn -> prove L2 burn -> co-sign with Claimer, finalize & mine on Signet.
 
   praxis demo [--advanced | --tier 1..6 | --tui]
       Encrypt to puzzles and decrypt with their solutions.
@@ -337,7 +337,8 @@ func runBridgeCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[2/6] Funded 2-of-2 Tapscript Vault — tr(NUMS, multi_a(2, Depositor, Claimer))\n")
+	fmt.Printf("[2/6] Funded Two-Leaf Tapscript Vault — tr(NUMS, {multi_a(2, Dep, Clm), pk(Dep_refund)+CSV(%d)})\n",
+		signet.VaultCSVBlocks)
 	fmt.Printf("      Vault P2TR:        %s\n", vault.VaultAddress)
 	fmt.Printf("      Deposit OutPoint:  %s (%.8f sBTC, mined in block #%d)\n",
 		vault.OutPoint(), float64(vault.DepositSats)/1e8, vault.DepositBlock)
@@ -355,14 +356,20 @@ func runBridgeCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	if depRug.FinalizableAlone || clmEarly.FinalizableAlone {
-		return fmt.Errorf("unexpected unilateral spend succeeded")
+	csvEarly, err := env.AttemptPrematureCSVRefund(vault)
+	if err != nil {
+		return err
 	}
-	fmt.Printf("[3/6] Verified Live-Key Unilateral Spend Resistance on Bitcoin Core\n")
-	fmt.Printf("      Depositor rug-pull (live key): 1-of-2 signed=%v, finalizable alone=%v -> BLOCKED\n",
+	if depRug.FinalizableAlone || clmEarly.FinalizableAlone || csvEarly.MempoolAllowed {
+		return fmt.Errorf("unexpected unilateral or premature CSV spend succeeded")
+	}
+	fmt.Printf("[3/6] Verified Live-Key Unilateral & Premature CSV Resistance on Bitcoin Core\n")
+	fmt.Printf("      Depositor Leaf-1 rug-pull: 1-of-2 signed=%v, finalizable alone=%v -> BLOCKED\n",
 		depRug.PartialSigned, depRug.FinalizableAlone)
-	fmt.Printf("      Claimer early take (live key): 1-of-2 signed=%v, finalizable alone=%v -> BLOCKED\n",
+	fmt.Printf("      Claimer Leaf-1 early take: 1-of-2 signed=%v, finalizable alone=%v -> BLOCKED\n",
 		clmEarly.PartialSigned, clmEarly.FinalizableAlone)
+	fmt.Printf("      Depositor Leaf-2 CSV(%d):   leaf finalized=%v, mempool allowed=%v (%s) -> BLOCKED\n",
+		csvEarly.CSVBlocks, csvEarly.LeafFinalized, csvEarly.MempoolAllowed, csvEarly.RejectReason)
 
 	ctx := bqs.BridgeContext{
 		VaultOutPoint:    vault.OutPoint(),

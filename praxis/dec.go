@@ -342,7 +342,7 @@ func dec(pp *Public, ct *Ciphertext, w []bool) ([]byte, DecReport, error) {
 	xiInv.Inverse(&xiKey)
 	key = gtExp(&key, xiInv.BigInt(new(big.Int)))
 	rep.TotalDur = time.Since(totalStart)
-	return xor(ct.Msg, keyPad(&key, len(ct.Msg))), rep, nil
+	return xor(ct.Msg, keyPadFor(&key, len(ct.Msg), par.SignClassKDF)), rep, nil
 }
 
 // centerBig is the middle of the range the secret sum r(w) can take under the

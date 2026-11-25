@@ -134,20 +134,64 @@ func sampleR(N int, g int64) []fr.Element {
 	return r
 }
 
-// keyPad is the key oracle: a pad of the given length from an element of GT.
-func keyPad(k *bn254.GT, length int) []byte {
-	kb := k.Bytes()
+func gtC0Bytes(k *bn254.GT) [192]byte {
+	var out [192]byte
+	coords := [6][32]byte{
+		k.C0.B0.A0.Bytes(),
+		k.C0.B0.A1.Bytes(),
+		k.C0.B1.A0.Bytes(),
+		k.C0.B1.A1.Bytes(),
+		k.C0.B2.A0.Bytes(),
+		k.C0.B2.A1.Bytes(),
+	}
+	for i, c := range coords {
+		copy(out[i*32:(i+1)*32], c[:])
+	}
+	return out
+}
+
+// keyPadFor is the key oracle: a pad of the given length from an element of GT
+// (Appendix A Figure 9) or, when signClass is true, from its unitary inverse
+// class {V, V^-1} uniquely represented on BN254 by V.C0 in F_{p^6}
+// (Section 6.4 and Praxis/Keys.lean's ClassName = Sym2 Label).
+func keyPadFor(k *bn254.GT, length int, signClass bool) []byte {
+	var material []byte
+	domain := "praxis-demo/key"
+	if signClass {
+		domain = "praxis-demo/sign-class-key"
+		c0 := gtC0Bytes(k)
+		material = c0[:]
+	} else {
+		kb := k.Bytes()
+		material = kb[:]
+	}
 	out := make([]byte, 0, length+sha256.Size)
 	var ctr [4]byte
 	for i := uint32(0); len(out) < length; i++ {
 		binary.BigEndian.PutUint32(ctr[:], i)
 		h := sha256.New()
-		h.Write([]byte("praxis-demo/key"))
+		h.Write([]byte(domain))
 		h.Write(ctr[:])
-		h.Write(kb[:])
+		h.Write(material)
 		out = h.Sum(out)
 	}
 	return out[:length]
+}
+
+func keyPad(k *bn254.GT, length int) []byte {
+	return keyPadFor(k, length, false)
+}
+
+// encCoins bundles the scalar coins of Figure 9 (lines 2-4) / Praxis/Enc.lean's Coins.
+type encCoins struct {
+	r, y                  []fr.Element
+	tau, omega12, omega22 fr.Element
+	alpha, pi             fr.Element
+	sKind                 [3]fr.Element // (bE, bO, bV) in Praxis/Enc.lean
+	ups                   fr.Element    // u in Praxis/Enc.lean
+	zeta, zeta1, zeta2    fr.Element    // (zeta, zeta', zeta4) in Praxis/Enc.lean
+	eta                   [3]fr.Element // (c1, c2, c3) in Praxis/Enc.lean
+	eps                   fr.Element
 }
 
 func xor(a, b []byte) []byte {
@@ -227,6 +271,85 @@ pick:
 		break
 	}
 
+	c := encCoins{
+		r:       r,
+		y:       y,
+		tau:     tau,
+		omega12: omega12,
+		omega22: omega22,
+		alpha:   alpha,
+		pi:      pi,
+		sKind:   sKind,
+		ups:     ups,
+		zeta:    zeta,
+		zeta1:   zeta1,
+		zeta2:   zeta2,
+		eta:     eta,
+		eps:     eps,
+	}
+	s1, s2, kappa, ak := pp.computeEncScalars(phi, c)
+	s2Both := make([]fr.Element, 2*len(s2))
+	copy(s2Both, s2)
+	s2a := s2Both[len(s2):]
+	for i := range s2 {
+		s2a[i].Mul(&s2[i], &alpha)
+	}
+
+	_, _, g1, g2 := bn254.Generators()
+	g2Both := bn254.BatchScalarMultiplicationG2(&g2, s2Both)
+	ct := &Ciphertext{
+		Seed: seed,
+		G1:   bn254.BatchScalarMultiplicationG1(&g1, s1),
+		G2:   g2Both[:len(s2)],
+		G2a:  g2Both[len(s2):],
+	}
+	gt, err := bn254.Pair([]bn254.G1Affine{g1}, []bn254.G2Affine{g2})
+	if err != nil {
+		return nil, EncReport{}, err
+	}
+	var key bn254.GT
+	key.Exp(gt, kappa.BigInt(new(big.Int)))
+	ct.Ka.Exp(gt, ak.BigInt(new(big.Int)))
+	ct.Msg = xor(msg, keyPadFor(&key, len(msg), par.SignClassKDF))
+	g1Count, g2Count := pp.Counts()
+	rep := EncReport{
+		EncDur: time.Since(start),
+		G1:     g1Count,
+		G2:     g2Count,
+		Bytes:  ct.Size(),
+		J:      l.jQuo,
+		Delta:  pp.Delta,
+		JPrime: l.jRem,
+		DeltaP: pp.DeltaPrime,
+		Forms:  n,
+		Cells:  par.Cells(),
+	}
+	return ct, rep, nil
+}
+
+// computeEncScalars evaluates Figure 9's G1, G2 (plain sector), key kappa, and
+// alpha*kappa field exponents deterministically from forms phi and coins c.
+func (pp *Public) computeEncScalars(phi [][]fr.Element, c encCoins) (s1, s2 []fr.Element, kappa, ak fr.Element) {
+	par, N, f := pp.Par, pp.S.N, pp.fld
+	n := par.NForms()
+	l := pp.layout()
+	r, y := c.r, c.y
+	tau, omega12, omega22 := c.tau, c.omega12, c.omega22
+	alpha, pi, sKind, ups := c.alpha, c.pi, c.sKind, c.ups
+	zeta, zeta1, zeta2, eta, eps := c.zeta, c.zeta1, c.zeta2, c.eta, c.eps
+	zpTau := pp.ZP.Eval(&tau)
+
+	omega2 := pow(&f.omega, 2)
+	var one, w2 fr.Element
+	one.SetOne()
+	w2.SetOne()
+	onePlus := make([]fr.Element, par.K1)
+	for k1 := 0; k1 < par.K1; k1++ {
+		onePlus[k1].Mul(&eps, &w2)
+		onePlus[k1].Add(&onePlus[k1], &one)
+		w2.Mul(&w2, &omega2)
+	}
+
 	// Line 5: the scalars of the legs and of the cells.
 	piK := make([]fr.Element, par.K1)
 	for k1 := range piK {
@@ -264,9 +387,9 @@ pick:
 	lrhoTau := lag[pp.rhoIndex()]
 	zTau, z0Tau := pp.Z.Eval(&tau), pp.Z0.Eval(&tau)
 
-	var kappa fr.Element
 	kappa.Mul(&piK[0], &sLeg[0])
 	kappa.Mul(&kappa, &lrhoTau)
+	ak.Mul(&alpha, &kappa)
 
 	// Lines 6 and 7: the tie masks.
 	var xMinus, xCirc, xPlus fr.Element
@@ -305,7 +428,7 @@ pick:
 	}
 
 	// The scalars of the G1 elements.
-	s1 := make([]fr.Element, l.lenG1())
+	s1 = make([]fr.Element, l.lenG1())
 	for k1 := 0; k1 < par.K1; k1++ {
 		for i := 0; i <= N; i++ {
 			// pi_k1 * (y_i, A_i(tau)) * Omega
@@ -333,7 +456,7 @@ pick:
 	}
 
 	// The scalars of the G2 elements.
-	s2 := make([]fr.Element, l.lenG2())
+	s2 = make([]fr.Element, l.lenG2())
 	var o22Inv, o12Over22 fr.Element
 	o22Inv.Inverse(&omega22)
 	o12Over22.Mul(&omega12, &o22Inv)
@@ -362,25 +485,25 @@ pick:
 	tauDeltaP := pow(&tau, pp.DeltaPrime)
 	for k1 := 0; k1 < par.K1; k1++ {
 		for leg := 0; leg < par.legs(); leg++ {
-			c := par.cell(k1, leg)
+			cel := par.cell(k1, leg)
 			var gamma fr.Element
 			gamma.Mul(&piK[k1], &sLeg[leg])
 			zc := zTau
-			if c == 0 {
+			if cel == 0 {
 				zc = zKey
 			}
 			var curQuo fr.Element
 			curQuo.Mul(&gamma, &zc)
 			curQuo.Mul(&curQuo, &zetaInv)
 			for j := 0; j < l.jQuo; j++ {
-				s2[l.bquo(c, j)] = curQuo
+				s2[l.bquo(cel, j)] = curQuo
 				curQuo.Mul(&curQuo, &tauDelta)
 			}
 			var curRem fr.Element
 			curRem.Mul(&gamma, &z0Tau)
 			curRem.Mul(&curRem, &zeta1Inv)
 			for j := 0; j < l.jRem; j++ {
-				s2[l.brem(c, j)] = curRem
+				s2[l.brem(cel, j)] = curRem
 				curRem.Mul(&curRem, &tauDeltaP)
 			}
 		}
@@ -413,45 +536,7 @@ pick:
 		}
 		tp.Mul(&tp, &ups)
 	}
-	s2Both := make([]fr.Element, 2*len(s2))
-	copy(s2Both, s2)
-	s2a := s2Both[len(s2):]
-	for i := range s2 {
-		s2a[i].Mul(&s2[i], &alpha)
-	}
-
-	_, _, g1, g2 := bn254.Generators()
-	g2Both := bn254.BatchScalarMultiplicationG2(&g2, s2Both)
-	ct := &Ciphertext{
-		Seed: seed,
-		G1:   bn254.BatchScalarMultiplicationG1(&g1, s1),
-		G2:   g2Both[:len(s2)],
-		G2a:  g2Both[len(s2):],
-	}
-	gt, err := bn254.Pair([]bn254.G1Affine{g1}, []bn254.G2Affine{g2})
-	if err != nil {
-		return nil, EncReport{}, err
-	}
-	var key bn254.GT
-	key.Exp(gt, kappa.BigInt(new(big.Int)))
-	var ak fr.Element
-	ak.Mul(&alpha, &kappa)
-	ct.Ka.Exp(gt, ak.BigInt(new(big.Int)))
-	ct.Msg = xor(msg, keyPad(&key, len(msg)))
-	g1Count, g2Count := pp.Counts()
-	rep := EncReport{
-		EncDur: time.Since(start),
-		G1:     g1Count,
-		G2:     g2Count,
-		Bytes:  ct.Size(),
-		J:      l.jQuo,
-		Delta:  pp.Delta,
-		JPrime: l.jRem,
-		DeltaP: pp.DeltaPrime,
-		Forms:  n,
-		Cells:  par.Cells(),
-	}
-	return ct, rep, nil
+	return s1, s2, kappa, ak
 }
 
 // Counts returns the number of elements of G1 and of G2 in a ciphertext of
@@ -469,6 +554,15 @@ func (pp *Public) PaperCounts() (g1, g2 int) {
 	n1 := (2*par.K1+1)*(N+1) + pp.Delta + (pp.Nu-1)*nc/jRem
 	n2 := 6*par.K2*(N+1) + 3*par.K2 + 3*n/2*(jQuo+jRem) + 13*n - 8
 	return n1, 2 * n2
+}
+
+// LeanCounts returns the element counts of Praxis/Published.lean (countG1, countG2),
+// which include the 2*K1 total-sum elements (totL1, totL2) in G1 and the 12*K2
+// total-sum elements (totR1, totR2 across .plain and .alpha) in G2 used in the
+// Lean generic-group proof.
+func (pp *Public) LeanCounts() (g1, g2 int) {
+	pG1, pG2 := pp.PaperCounts()
+	return pG1 + 2*pp.Par.K1, pG2 + 12*pp.Par.K2
 }
 
 // Size is the ciphertext's length in bytes with compressed points.

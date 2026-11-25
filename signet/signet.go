@@ -1,22 +1,22 @@
 // Package signet drives a local private Bitcoin Signet (signetchallenge=51)
-// to demonstrate operator-free Praxis witness-encrypted 2-of-2 Taproot vaults.
+// to demonstrate operator-free Praxis witness-encrypted 2-of-2 Taproot vaults
+// with an OP_CHECKSEQUENCEVERIFY (CSV) timelock refund leaf.
 //
 // Vault construction (following [Hio22] / Section 1 of the Praxis paper):
-//   - Funds are locked in a 2-of-2 Tapscript output:
-//       tr(NUMS, multi_a(2, Depositor, Claimer))
-//     where NUMS is BIP-341's standard nothing-up-my-sleeve internal key
-//     (50929b74...e803ac0, making key-path spends impossible) and multi_a(2, ...)
-//     compiles to <Depositor> OP_CHECKSIG <Claimer> OP_CHECKSIGADD 2 OP_NUMEQUAL.
+//   - Funds are locked in a two-leaf Tapscript tree under BIP-341's unspendable
+//     nothing-up-my-sleeve internal key NUMS (50929b74...e803ac0, disabling key-path spends):
+//       tr(NUMS, {multi_a(2, Depositor, Claimer), and_v(v:pk(Depositor_refund), older(6))})
+//     * Leaf 1 (happy-path claim): <Depositor> OP_CHECKSIG <Claimer> OP_CHECKSIGADD 2 OP_NUMEQUAL
+//     * Leaf 2 (timeout refund):   <Depositor_refund> OP_CHECKSIGVERIFY <6> OP_CHECKSEQUENCEVERIFY
 //   - Both Depositor and Claimer keep their private keys LIVE in separate wallets
 //     throughout; nobody is asked to trust that a key file was deleted.
-//   - Depositor pre-signs ONLY its 1-of-2 partial PSBT for the withdrawal to
-//     Claimer, seals that partial PSBT inside a Praxis ciphertext under the L2
-//     burn statement, and goes offline.
-//   - Depositor alone cannot rug-pull (1-of-2 PSBT is incomplete); Claimer alone
-//     cannot steal early (1-of-2 PSBT is incomplete without Praxis decryption).
-//   - Once Claimer supplies a valid L2 burn witness, Praxis reveals Depositor's
-//     partial PSBT, Claimer co-signs the 2nd Schnorr signature, finalizes the
-//     OP_CHECKSIGADD witness, and settles on Signet with Depositor offline.
+//   - Depositor pre-signs ONLY its 1-of-2 partial PSBT for Leaf 1 paying Claimer,
+//     seals that partial PSBT inside a Praxis ciphertext under the L2 burn statement,
+//     and goes offline.
+//   - Before 6 blocks elapse, Depositor cannot rug-pull via Leaf 1 (1-of-2 incomplete)
+//     nor via Leaf 2 (rejected by consensus with non-BIP68-final); Claimer cannot
+//     steal early via Leaf 1 without Praxis decryption. If Claimer ghosts without
+//     burning on L2, Depositor reclaims the 1.0 sBTC via Leaf 2 once 6 blocks pass.
 //
 // Safety invariant: every RPC connection refuses mainnet ports (8332, 8382)
 // and verifies getblockchaininfo().chain == "signet" before doing anything.
@@ -55,6 +55,9 @@ const (
 	VaultFeeSats int64 = 2_000
 	// VaultWithdrawSats is 0.99998000 sBTC delivered to Claimer's tb1p address.
 	VaultWithdrawSats int64 = VaultDepositSats - VaultFeeSats
+	// VaultCSVBlocks is the relative BIP-68 / OP_CHECKSEQUENCEVERIFY block delay
+	// before Depositor can reclaim an unclaimed vault via Tapscript Leaf 2.
+	VaultCSVBlocks uint32 = 6
 )
 
 func defaultOctopiDir() string {
@@ -146,12 +149,22 @@ type ChainStatus struct {
 }
 
 // UnilateralAttempt records the result of either party trying to spend the 2-of-2
-// vault on their own (with their live private key intact).
+// claim leaf on their own (with their live private key intact).
 type UnilateralAttempt struct {
 	Actor            string // "depositor" or "claimer"
 	WalletKeysLive   bool
 	PartialSigned    bool
 	FinalizableAlone bool
+}
+
+// CSVRefundAttempt records Depositor's attempt to broadcast the Leaf 2 OP_CSV
+// refund transaction before VaultCSVBlocks confirmations have elapsed.
+type CSVRefundAttempt struct {
+	CSVBlocks        uint32
+	LeafFinalized    bool   // true: Depositor holds the sole key for Leaf 2
+	MempoolAllowed   bool   // false before VaultCSVBlocks confirmations
+	RejectReason     string // e.g. "non-BIP68-final"
+	SignedRefundTxID string
 }
 
 // LockedVault holds the public parameters of a funded 2-of-2 Taproot
@@ -750,9 +763,9 @@ func (e *Env) waitForPeerSync(timeout time.Duration) bool {
 	return false
 }
 
-// extractTrKeyExpr pulls the inner key expression "[fp/86h/1h/0h]tprv.../0/*" or
-// "[fp/86h/1h/0h]tpub.../0/*" from a wallet's external Taproot descriptor.
-func (e *Env) extractTrKeyExpr(wallet string, priv bool) (string, error) {
+// extractTrKeyExprBranch pulls the inner key expression "[fp/86h/1h/0h]tprv.../<branch>/*"
+// or "[fp/86h/1h/0h]tpub.../<branch>/*" from a wallet's BIP-86 Taproot descriptor.
+func (e *Env) extractTrKeyExprBranch(wallet string, branch int, priv bool) (string, error) {
 	var res struct {
 		Descriptors []struct {
 			Desc string `json:"desc"`
@@ -761,15 +774,16 @@ func (e *Env) extractTrKeyExpr(wallet string, priv bool) (string, error) {
 	if err := e.Primary.Call(wallet, "listdescriptors", []any{priv}, &res); err != nil {
 		return "", err
 	}
+	needle := fmt.Sprintf("/%d/*", branch)
 	for _, d := range res.Descriptors {
-		if strings.HasPrefix(d.Desc, "tr(") && strings.Contains(d.Desc, "/0/*") {
+		if strings.HasPrefix(d.Desc, "tr(") && strings.Contains(d.Desc, needle) {
 			end := strings.LastIndex(d.Desc, ")#")
 			if end > 3 {
 				return d.Desc[3:end], nil
 			}
 		}
 	}
-	return "", fmt.Errorf("no external tr(...) descriptor in wallet %s", wallet)
+	return "", fmt.Errorf("no branch %d tr(...) descriptor in wallet %s", branch, wallet)
 }
 
 func (e *Env) importVaultDescriptor(wallet, rawDesc string) error {
@@ -827,26 +841,37 @@ func (e *Env) LockTaprootVault() (*LockedVault, error) {
 		e.sessionWallets = append(e.sessionWallets, w)
 	}
 
-	depPriv, err := e.extractTrKeyExpr(depWallet, true)
+	dep0Priv, err := e.extractTrKeyExprBranch(depWallet, 0, true)
 	if err != nil {
 		return nil, err
 	}
-	depPub, err := e.extractTrKeyExpr(depWallet, false)
+	dep0Pub, err := e.extractTrKeyExprBranch(depWallet, 0, false)
 	if err != nil {
 		return nil, err
 	}
-	clmPriv, err := e.extractTrKeyExpr(clmWallet, true)
+	dep1Priv, err := e.extractTrKeyExprBranch(depWallet, 1, true)
 	if err != nil {
 		return nil, err
 	}
-	clmPub, err := e.extractTrKeyExpr(clmWallet, false)
+	dep1Pub, err := e.extractTrKeyExprBranch(depWallet, 1, false)
+	if err != nil {
+		return nil, err
+	}
+	clm0Priv, err := e.extractTrKeyExprBranch(clmWallet, 0, true)
+	if err != nil {
+		return nil, err
+	}
+	clm0Pub, err := e.extractTrKeyExprBranch(clmWallet, 0, false)
 	if err != nil {
 		return nil, err
 	}
 
-	rawForDep := fmt.Sprintf("tr(%s,multi_a(2,%s,%s))", BIP341NUMSInternalKey, depPriv, clmPub)
-	rawForClm := fmt.Sprintf("tr(%s,multi_a(2,%s,%s))", BIP341NUMSInternalKey, depPub, clmPriv)
-	rawPub := fmt.Sprintf("tr(%s,multi_a(2,%s,%s))", BIP341NUMSInternalKey, depPub, clmPub)
+	rawForDep := fmt.Sprintf("tr(%s,{multi_a(2,%s,%s),and_v(v:pk(%s),older(%d))})",
+		BIP341NUMSInternalKey, dep0Priv, clm0Pub, dep1Priv, VaultCSVBlocks)
+	rawForClm := fmt.Sprintf("tr(%s,{multi_a(2,%s,%s),and_v(v:pk(%s),older(%d))})",
+		BIP341NUMSInternalKey, dep0Pub, clm0Priv, dep1Pub, VaultCSVBlocks)
+	rawPub := fmt.Sprintf("tr(%s,{multi_a(2,%s,%s),and_v(v:pk(%s),older(%d))})",
+		BIP341NUMSInternalKey, dep0Pub, clm0Pub, dep1Pub, VaultCSVBlocks)
 
 	if err := e.importVaultDescriptor(depWallet, rawForDep); err != nil {
 		return nil, fmt.Errorf("import 2-of-2 descriptor into depositor: %w", err)
@@ -907,8 +932,10 @@ func (e *Env) LockTaprootVault() (*LockedVault, error) {
 		return nil, fmt.Errorf("2-of-2 vault output %s not found in tx %s", vaultAddr, depositTxID)
 	}
 
-	// Construct the unsigned withdrawal PSBT paying Claimer 0.99998000 sBTC.
-	inputs := []map[string]any{{"txid": depositTxID, "vout": depositVout}}
+	// Construct the unsigned Leaf-1 withdrawal PSBT paying Claimer 0.99998000 sBTC.
+	// Setting sequence=0xfffffffe disables BIP-68 relative locktime so Miniscript
+	// targets Leaf 1 (multi_a(2, Depositor, Claimer)) rather than Leaf 2 (older(6)).
+	inputs := []map[string]any{{"txid": depositTxID, "vout": depositVout, "sequence": uint32(0xfffffffe)}}
 	outputs := []map[string]any{{recipientAddr: json.Number("0.99998000")}}
 	var unsignedPSBT string
 	if err := e.Primary.Call("", "createpsbt", []any{inputs, outputs}, &unsignedPSBT); err != nil {
@@ -1014,7 +1041,7 @@ func (e *Env) AttemptUnilateralSpend(vault *LockedVault, actor string) (Unilater
 	if err := e.Primary.Call(wallet, "getnewaddress", []any{"", "bech32m"}, &dest); err != nil {
 		return UnilateralAttempt{}, err
 	}
-	inputs := []map[string]any{{"txid": vault.DepositTxID, "vout": vault.DepositVout}}
+	inputs := []map[string]any{{"txid": vault.DepositTxID, "vout": vault.DepositVout, "sequence": uint32(0xfffffffe)}}
 	outputs := []map[string]any{{dest: json.Number("0.99998000")}}
 	var psbt string
 	if err := e.Primary.Call("", "createpsbt", []any{inputs, outputs}, &psbt); err != nil {
@@ -1042,6 +1069,135 @@ func (e *Env) AttemptUnilateralSpend(vault *LockedVault, actor string) (Unilater
 		WalletKeysLive:   true,
 		PartialSigned:    sig != "",
 		FinalizableAlone: proc.Complete || fin.Complete,
+	}, nil
+}
+
+func (e *Env) buildSignedCSVRefundTx(vault *LockedVault, refundDest string) (txHex, txid string, witnessItems int, err error) {
+	inputs := []map[string]any{{"txid": vault.DepositTxID, "vout": vault.DepositVout, "sequence": VaultCSVBlocks}}
+	outputs := []map[string]any{{refundDest: json.Number("0.99998000")}}
+	var psbt string
+	if err := e.Primary.Call("", "createpsbt", []any{inputs, outputs}, &psbt); err != nil {
+		return "", "", 0, fmt.Errorf("createpsbt csv refund: %w", err)
+	}
+	var proc struct {
+		PSBT     string `json:"psbt"`
+		Complete bool   `json:"complete"`
+		Hex      string `json:"hex"`
+	}
+	if err := e.Primary.Call(vault.DepositorWallet, "walletprocesspsbt", []any{psbt, true, "DEFAULT", true, true}, &proc); err != nil {
+		return "", "", 0, fmt.Errorf("depositor csv walletprocesspsbt: %w", err)
+	}
+	txHex = proc.Hex
+	if txHex == "" {
+		var fin struct {
+			Hex      string `json:"hex"`
+			Complete bool   `json:"complete"`
+		}
+		if err := e.Primary.Call("", "finalizepsbt", []any{proc.PSBT}, &fin); err != nil {
+			return "", "", 0, fmt.Errorf("finalizepsbt csv refund: %w", err)
+		}
+		if !fin.Complete || fin.Hex == "" {
+			return "", "", 0, errors.New("csv refund PSBT failed to finalize with Depositor refund key")
+		}
+		txHex = fin.Hex
+	}
+	var decoded struct {
+		TxID string `json:"txid"`
+		Vin  []struct {
+			TxInWitness []string `json:"txinwitness"`
+		} `json:"vin"`
+	}
+	if err := e.Primary.Call("", "decoderawtransaction", []any{txHex}, &decoded); err != nil {
+		return "", "", 0, err
+	}
+	if len(decoded.Vin) > 0 {
+		witnessItems = len(decoded.Vin[0].TxInWitness)
+	}
+	return txHex, decoded.TxID, witnessItems, nil
+}
+
+// AttemptPrematureCSVRefund constructs and finalizes Depositor's Leaf-2 OP_CSV
+// refund transaction (nSequence = VaultCSVBlocks) and submits it to Bitcoin Core's
+// testmempoolaccept, demonstrating that consensus rejects early Depositor refunds
+// with "non-BIP68-final" before VaultCSVBlocks confirmations have elapsed.
+func (e *Env) AttemptPrematureCSVRefund(vault *LockedVault) (CSVRefundAttempt, error) {
+	var refundAddr string
+	if err := e.Primary.Call(vault.DepositorWallet, "getnewaddress", []any{"", "bech32m"}, &refundAddr); err != nil {
+		return CSVRefundAttempt{}, err
+	}
+	txHex, txid, _, err := e.buildSignedCSVRefundTx(vault, refundAddr)
+	if err != nil {
+		return CSVRefundAttempt{}, err
+	}
+	var memRes []struct {
+		TxID         string `json:"txid"`
+		Allowed      bool   `json:"allowed"`
+		RejectReason string `json:"reject-reason"`
+	}
+	if err := e.Primary.Call("", "testmempoolaccept", []any{[]string{txHex}}, &memRes); err != nil {
+		return CSVRefundAttempt{}, fmt.Errorf("testmempoolaccept csv refund: %w", err)
+	}
+	if len(memRes) == 0 {
+		return CSVRefundAttempt{}, errors.New("empty testmempoolaccept response")
+	}
+	return CSVRefundAttempt{
+		CSVBlocks:        VaultCSVBlocks,
+		LeafFinalized:    true,
+		MempoolAllowed:   memRes[0].Allowed,
+		RejectReason:     memRes[0].RejectReason,
+		SignedRefundTxID: txid,
+	}, nil
+}
+
+// ExecuteCSVRefund broadcasts and mines Depositor's Leaf-2 OP_CHECKSEQUENCEVERIFY
+// refund transaction once at least VaultCSVBlocks confirmations have elapsed,
+// recovering the locked funds when Claimer fails to burn on L2.
+func (e *Env) ExecuteCSVRefund(vault *LockedVault) (*SweepSettlement, error) {
+	if _, err := e.Primary.verifySignet(); err != nil {
+		return nil, err
+	}
+	var refundAddr string
+	if err := e.Primary.Call(vault.DepositorWallet, "getnewaddress", []any{"", "bech32m"}, &refundAddr); err != nil {
+		return nil, err
+	}
+	txHex, _, witnessItems, err := e.buildSignedCSVRefundTx(vault, refundAddr)
+	if err != nil {
+		return nil, err
+	}
+	var refundTxID string
+	if err := e.Primary.Call("", "sendrawtransaction", []any{txHex}, &refundTxID); err != nil {
+		return nil, fmt.Errorf("sendrawtransaction csv refund: %w", err)
+	}
+	height, blockHash, err := e.MineBlocks(1)
+	if err != nil {
+		return nil, fmt.Errorf("mine csv refund block: %w", err)
+	}
+	unspent, err := e.IsOutPointUnspent(vault.DepositTxID, vault.DepositVout)
+	if err != nil {
+		return nil, err
+	}
+	var outInfo struct {
+		Value float64 `json:"value"`
+	}
+	if err := e.Primary.Call("", "gettxout", []any{refundTxID, 0, true}, &outInfo); err != nil {
+		return nil, fmt.Errorf("verify depositor refund utxo: %w", err)
+	}
+	peerSynced := false
+	peerH := -1
+	if e.Peer != nil {
+		peerSynced = e.waitForPeerSync(5 * time.Second)
+		_ = e.Peer.Call("", "getblockcount", nil, &peerH)
+	}
+	return &SweepSettlement{
+		SweepTxID:       refundTxID,
+		WitnessItems:    witnessItems,
+		TxBytes:         len(txHex) / 2,
+		BlockHeight:     height,
+		BlockHash:       blockHash,
+		PeerSynced:      peerSynced,
+		PeerBlockHeight: peerH,
+		VaultSpent:      !unspent,
+		RecipientSats:   int64(outInfo.Value*1e8 + 0.5),
 	}, nil
 }
 

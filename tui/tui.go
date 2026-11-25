@@ -230,6 +230,7 @@ type signetVaultState struct {
 	vault        *signet.LockedVault
 	depRug       signet.UnilateralAttempt
 	clmEarly     signet.UnilateralAttempt
+	csvEarly     signet.CSVRefundAttempt
 	settlement   *signet.SweepSettlement
 	utxoUnspent  bool
 	secret1Hex   string
@@ -431,6 +432,10 @@ func lockSignetVaultAndEncrypt(existingEnv *signet.Env, par praxis.Params, padAd
 	if err != nil {
 		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
 	}
+	csvEarly, err := env.AttemptPrematureCSVRefund(vault)
+	if err != nil {
+		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
+	}
 	st, err := env.Status()
 	if err != nil {
 		return env, nil, nil, 0, nil, praxis.EncReport{}, baseSc, err
@@ -493,6 +498,7 @@ func lockSignetVaultAndEncrypt(existingEnv *signet.Env, par praxis.Params, padAd
 		vault:       vault,
 		depRug:      depRug,
 		clmEarly:    clmEarly,
+		csvEarly:    csvEarly,
 		utxoUnspent: true,
 		secret1Hex:  s1Hex,
 		secret3Hex:  s3Hex,
@@ -1163,7 +1169,7 @@ func (m *Model) View() tea.View {
 		rightLines = append(rightLines, "")
 		rightLines = append(rightLines, sectionBar("BITCOIN PRIVATE SIGNET · 2-OF-2 P2TR VAULT", "challenge=51", rightW-4))
 		if m.sigState == nil || m.sigState.vault == nil {
-			rightLines = append(rightLines, stMuted.Render("Script: ")+stCyan.Render("tr(NUMS, multi_a(2, Depositor, Claimer))")+stMuted.Render(" · OP_CHECKSIGADD"))
+			rightLines = append(rightLines, stMuted.Render("Script: ")+stCyan.Render("tr(NUMS, {multi_a(2,Dep,Clm), pk(Dep)+CSV(6)})"))
 			rightLines = append(rightLines, stMuted.Render("Press ")+stCyan.Render("[e]")+stMuted.Render(" to fund 1.0 sBTC (both keys kept LIVE; Depositor seals 1/2 PSBT)."))
 		} else {
 			sv := m.sigState
@@ -1178,11 +1184,12 @@ func (m *Model) View() tea.View {
 			}
 			rightLines = append(rightLines, fmt.Sprintf("%s %s (%s #%d%s) · %s",
 				stMuted.Render("Network:"), stCyan.Render(sv.status.Mode), sv.status.PrimaryRPC, sv.status.Height, peerBadge, utxoBadge))
-			rightLines = append(rightLines, fmt.Sprintf("%s %s · %s · %s",
-				stMuted.Render("2-of-2:"),
+			rightLines = append(rightLines, fmt.Sprintf("%s %s · %s · %s · %s",
+				stMuted.Render("Guards:"),
 				stSub.Render("BOTH KEYS LIVE"),
-				stGreen.Render(fmt.Sprintf("Dep rug-pull=%v", sv.depRug.FinalizableAlone)),
-				stGreen.Render(fmt.Sprintf("Clm alone=%v", sv.clmEarly.FinalizableAlone)),
+				stGreen.Render(fmt.Sprintf("Dep=%v", sv.depRug.FinalizableAlone)),
+				stGreen.Render(fmt.Sprintf("Clm=%v", sv.clmEarly.FinalizableAlone)),
+				stGreen.Render(fmt.Sprintf("CSV(%d)=%s", sv.csvEarly.CSVBlocks, sv.csvEarly.RejectReason)),
 			))
 			rightLines = append(rightLines, fmt.Sprintf("%s %s:%d (#%d) -> %s…",
 				stMuted.Render("Deposit:"), stSub.Render(v.DepositTxID[:14]+"…"), v.DepositVout, v.DepositBlock, v.RecipientAddress[:18]))

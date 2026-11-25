@@ -20,9 +20,10 @@ type Params struct {
 	K1     int   // left legs
 	K2     int   // right legs of each kind; K1*K2 = n/2
 	G      int64 // range of each secret integer
-	J      int   // chunks of quotient powers (0 means 1)
-	JPrime int   // chunks of remainder powers, dividing nc (0 means 1)
-	Fast   bool  // bit-reversed H, radix-2 FFTs, and outward sign-class fingerprint search
+	J            int   // chunks of quotient powers (0 means 1)
+	JPrime       int   // chunks of remainder powers, dividing nc (0 means 1)
+	Fast         bool  // bit-reversed H, radix-2 FFTs, and outward sign-class fingerprint search
+	SignClassKDF bool  // derive message pad from {V, V^-1} via V.C0 (Section 6.4 / Praxis/Keys.lean)
 }
 
 // Toy is the default: eight forms, twelve copies of the table, and secret

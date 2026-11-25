@@ -65,6 +65,13 @@ func TestEphemeralSignet2of2TaprootPraxisBridgeEndToEnd(t *testing.T) {
 	if !clmEarly.WalletKeysLive || !clmEarly.PartialSigned || clmEarly.FinalizableAlone {
 		t.Fatalf("expected claimer premature spend to produce 1-of-2 partial sig and fail finalization: %+v", clmEarly)
 	}
+	csvEarly, err := env.AttemptPrematureCSVRefund(vault)
+	if err != nil {
+		t.Fatalf("AttemptPrematureCSVRefund: %v", err)
+	}
+	if !csvEarly.LeafFinalized || csvEarly.MempoolAllowed || !strings.Contains(csvEarly.RejectReason, "BIP68") {
+		t.Fatalf("expected premature Leaf-2 CSV refund to be rejected with non-BIP68-final, got %+v", csvEarly)
+	}
 
 	// 3. Build the L2 burn-commitment batch bound to this exact Bitcoin withdrawal,
 	//    encrypt Depositor's 1-of-2 partial PSBT with Praxis, and wipe the plaintext copy.
@@ -145,5 +152,32 @@ func TestEphemeralSignet2of2TaprootPraxisBridgeEndToEnd(t *testing.T) {
 	}
 	if !settle.VaultSpent || settle.RecipientSats != VaultWithdrawSats {
 		t.Fatalf("unexpected settlement state: %+v", settle)
+	}
+
+	// 7. Test Leaf-2 OP_CHECKSEQUENCEVERIFY timeout refund on a second vault when Claimer ghosts:
+	//    rejected before 6 confirmations (non-BIP68-final), accepted & settled once 6 blocks pass!
+	ghostVault, err := env.LockTaprootVault()
+	if err != nil {
+		t.Fatalf("LockTaprootVault (ghost vault): %v", err)
+	}
+	earlyRefund, err := env.AttemptPrematureCSVRefund(ghostVault)
+	if err != nil {
+		t.Fatalf("AttemptPrematureCSVRefund (ghost vault): %v", err)
+	}
+	if earlyRefund.MempoolAllowed || !strings.Contains(earlyRefund.RejectReason, "BIP68") {
+		t.Fatalf("expected non-BIP68-final before %d blocks, got %+v", VaultCSVBlocks, earlyRefund)
+	}
+	if _, _, err := env.MineBlocks(int(VaultCSVBlocks) - 1); err != nil {
+		t.Fatalf("MineBlocks for CSV expiry: %v", err)
+	}
+	refundSettle, err := env.ExecuteCSVRefund(ghostVault)
+	if err != nil {
+		t.Fatalf("ExecuteCSVRefund after %d confirmations: %v", VaultCSVBlocks, err)
+	}
+	if refundSettle.WitnessItems != 3 {
+		t.Fatalf("expected 3 witness items [sig_dep_refund, csv_script, control_block] on Leaf 2, got %d", refundSettle.WitnessItems)
+	}
+	if !refundSettle.VaultSpent || refundSettle.RecipientSats != VaultWithdrawSats {
+		t.Fatalf("unexpected CSV refund settlement: %+v", refundSettle)
 	}
 }
