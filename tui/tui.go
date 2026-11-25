@@ -23,7 +23,7 @@ import (
 	"praxis-demo/signet"
 )
 
-// silkPalette holds one SilkCircuit variant's published colors (matching crust/styles/silkcircuit.go).
+// silkPalette holds one SilkCircuit color palette variant.
 type silkPalette struct {
 	name      string
 	bg        color.Color
@@ -1021,7 +1021,7 @@ func (m *Model) View() tea.View {
 	gap := max(2, inner-ansi.StringWidth(mark)-ansi.StringWidth(rightHead))
 	header := " " + mark + strings.Repeat(" ", gap) + rightHead
 
-	// --- FULL-WIDTH SPECTRUM SLIDER DECK (crust/tui/slider.go style) ---
+	// --- FULL-WIDTH SPECTRUM SLIDER DECK ---
 	var deckLines []string
 	deckLines = append(deckLines, sectionBar(
 		fmt.Sprintf("PARAMETER SPECTRUM · TIER %d/6: %s (%s)", tier.Index, strings.ToUpper(tier.Name), tier.Subtitle),
@@ -1029,7 +1029,7 @@ func (m *Model) View() tea.View {
 		inner-4,
 	))
 
-	// Render the crust-style logarithmic slider track across all 6 stops with labeled stop ticks.
+	// Render the logarithmic slider track across all 6 stops with labeled stop ticks.
 	shortNames := [6]string{"Toy", "Adv", "Med", "Hvy", "Pre", "Tbl4"}
 	var tierPills []string
 	for i, tr := range praxis.Spectrum {

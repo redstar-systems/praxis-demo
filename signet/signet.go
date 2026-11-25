@@ -60,13 +60,6 @@ const (
 	VaultCSVBlocks uint32 = 6
 )
 
-func defaultOctopiDir() string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, "CODE", "GITS", "octopi-testnet")
-	}
-	return ""
-}
-
 // BIP-380 output script descriptor checksum alphabets.
 const (
 	descInputCharset    = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
@@ -138,7 +131,7 @@ func withDescriptorChecksum(raw string) (string, error) {
 
 // ChainStatus summarizes the live private Signet state across primary (and optional peer) nodes.
 type ChainStatus struct {
-	Mode        string // "octopi-testnet" or "ephemeral-signet"
+	Mode        string // "local-signet", "custom-signet", or "ephemeral-signet"
 	PrimaryRPC  string
 	PeerRPC     string
 	Chain       string
@@ -212,7 +205,7 @@ type SweepSettlement struct {
 type Env struct {
 	Mode        string
 	Primary     *RPCClient
-	Peer        *RPCClient // optional second signet node (e.g., octopi-testnet node-b)
+	Peer        *RPCClient // optional second local signet peer node
 	PrimaryData string
 	StartedNode bool
 
@@ -359,40 +352,32 @@ func (c *RPCClient) verifySignet() (blockchainInfo, error) {
 	return info, nil
 }
 
-// FindBitcoind locates a local Bitcoin Core daemon binary, preferring the exact
-// v30.2.0 binary used by octopi-testnet when forOctopi is true.
-func FindBitcoind(forOctopi bool) (string, error) {
+// FindBitcoind locates a local Bitcoin Core daemon binary via PRAXIS_BITCOIND,
+// standard system PATH, or common Homebrew/system install paths.
+func FindBitcoind(_ bool) (string, error) {
 	var candidates []string
 	if envBin := os.Getenv("PRAXIS_BITCOIND"); envBin != "" {
 		candidates = append(candidates, envBin)
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		candidates = append(candidates,
-			filepath.Join(home, "CODE", "GITS", "rednode3", ".rednode", "runtime", "state", "bitcoin", "bin", "bitcoind"),
-			filepath.Join(home, "CODE", "GITS", "Rednode-RC1", ".rednode", "runtime", "state", "bitcoin", "bin", "bitcoind"),
-		)
-		if !forOctopi {
-			candidates = append(candidates,
-				filepath.Join(home, "Library", "Application Support", "Octopi", "tools", "bitcoind", "28.1", "bitcoin-28.1", "bin", "bitcoind"),
-			)
-		}
+	if p, err := exec.LookPath("bitcoind"); err == nil {
+		candidates = append(candidates, p)
 	}
+	candidates = append(candidates,
+		"/opt/homebrew/bin/bitcoind",
+		"/usr/local/bin/bitcoind",
+		"/usr/bin/bitcoind",
+	)
 	for _, p := range candidates {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p, nil
 		}
 	}
-	if !forOctopi {
-		if p, err := exec.LookPath("bitcoind"); err == nil {
-			return p, nil
-		}
-	}
-	return "", errors.New("bitcoind binary not found")
+	return "", errors.New("bitcoind binary not found (install Bitcoin Core or set PRAXIS_BITCOIND)")
 }
 
-// ConnectAttachOrStart connects to an explicit RPC, or to octopi-testnet's
-// private Signet (:38401 / :38402, starting node-a and node-b if stopped),
-// falling back to an ephemeral signetchallenge=51 node if octopi-testnet is absent.
+// ConnectAttachOrStart connects to an explicit RPC, or to a local two-node private
+// Signet pointed to by PRAXIS_SIGNET_DIR (:38401 / :38402), falling back to an
+// isolated ephemeral signetchallenge=51 node.
 func ConnectAttachOrStart(explicitRPC, explicitCookie string) (*Env, error) {
 	if explicitRPC != "" {
 		cli, err := NewRPCClient(explicitRPC, explicitCookie, "")
@@ -412,24 +397,20 @@ func ConnectAttachOrStart(explicitRPC, explicitCookie string) (*Env, error) {
 		return env, nil
 	}
 
-	octopiDir := os.Getenv("OCTOPI_TESTNET_DIR")
-	if octopiDir == "" {
-		octopiDir = defaultOctopiDir()
-	}
-	if octopiDir != "" {
-		nodeAConf := filepath.Join(octopiDir, "state", "a", "node", "bitcoin.conf")
+	if signetDir := os.Getenv("PRAXIS_SIGNET_DIR"); signetDir != "" {
+		nodeAConf := filepath.Join(signetDir, "state", "a", "node", "bitcoin.conf")
 		if _, err := os.Stat(nodeAConf); err == nil {
-			return ConnectOctopi(octopiDir)
+			return ConnectLocalSignet(signetDir)
 		}
 	}
 	return StartEphemeral()
 }
 
-// ConnectOctopi attaches to octopi-testnet's node-a (:38401) and node-b (:38402),
+// ConnectLocalSignet attaches to a local two-node private Signet (:38401 and :38402),
 // starting either bitcoind cleanly if currently stopped and syncing their tips.
-func ConnectOctopi(octopiDir string) (*Env, error) {
-	nodeADir := filepath.Join(octopiDir, "state", "a", "node")
-	nodeBDir := filepath.Join(octopiDir, "state", "b", "node")
+func ConnectLocalSignet(signetDir string) (*Env, error) {
+	nodeADir := filepath.Join(signetDir, "state", "a", "node")
+	nodeBDir := filepath.Join(signetDir, "state", "b", "node")
 	cookieA := filepath.Join(nodeADir, "signet", ".cookie")
 	cookieB := filepath.Join(nodeBDir, "signet", ".cookie")
 
@@ -446,15 +427,15 @@ func ConnectOctopi(octopiDir string) (*Env, error) {
 	if _, err := cliA.verifySignet(); err != nil {
 		bin, berr := FindBitcoind(true)
 		if berr != nil {
-			return nil, fmt.Errorf("octopi-testnet node-a is stopped and bitcoind not found: %w", berr)
+			return nil, fmt.Errorf("local signet node-a is stopped and bitcoind not found: %w", berr)
 		}
-		pid, serr := spawnDetachedBitcoind(bin, nodeADir, filepath.Join(octopiDir, "state", "node-a.log"))
+		pid, serr := spawnDetachedBitcoind(bin, nodeADir, filepath.Join(signetDir, "state", "node-a.log"))
 		if serr != nil {
 			return nil, serr
 		}
-		updateOctopiPids(filepath.Join(octopiDir, "state", "pids.json"), "node-a", pid)
+		updateSignetPids(filepath.Join(signetDir, "state", "pids.json"), "node-a", pid)
 		if err := waitSignetReady(cliA, 20*time.Second); err != nil {
-			return nil, fmt.Errorf("waiting for octopi-testnet node-a: %w", err)
+			return nil, fmt.Errorf("waiting for local signet node-a: %w", err)
 		}
 		startedAny = true
 	}
@@ -462,8 +443,8 @@ func ConnectOctopi(octopiDir string) (*Env, error) {
 	if _, stErr := os.Stat(filepath.Join(nodeBDir, "bitcoin.conf")); stErr == nil {
 		if _, err := cliB.verifySignet(); err != nil {
 			if bin, berr := FindBitcoind(true); berr == nil {
-				if pid, serr := spawnDetachedBitcoind(bin, nodeBDir, filepath.Join(octopiDir, "state", "node-b.log")); serr == nil {
-					updateOctopiPids(filepath.Join(octopiDir, "state", "pids.json"), "node-b", pid)
+				if pid, serr := spawnDetachedBitcoind(bin, nodeBDir, filepath.Join(signetDir, "state", "node-b.log")); serr == nil {
+					updateSignetPids(filepath.Join(signetDir, "state", "pids.json"), "node-b", pid)
 					_ = waitSignetReady(cliB, 20*time.Second)
 					startedAny = true
 				}
@@ -474,7 +455,7 @@ func ConnectOctopi(octopiDir string) (*Env, error) {
 	}
 
 	env := &Env{
-		Mode:        "octopi-testnet",
+		Mode:        "local-signet",
 		Primary:     cliA,
 		Peer:        cliB,
 		PrimaryData: nodeADir,
@@ -505,7 +486,7 @@ func spawnDetachedBitcoind(bin, datadir, logPath string) (int, error) {
 	return pid, nil
 }
 
-func updateOctopiPids(pidsPath, key string, pid int) {
+func updateSignetPids(pidsPath, key string, pid int) {
 	pids := map[string]int{}
 	if raw, err := os.ReadFile(pidsPath); err == nil {
 		_ = json.Unmarshal(raw, &pids)
