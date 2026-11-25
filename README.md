@@ -2,7 +2,7 @@
 
 An executable Go prototype of **Praxis**, the witness encryption scheme for NP of Tse, Vanjani, and Vesely (*"Praxis: Practical Witness Encryption for NP"*, IACR ePrint 2026/2971), built over BN254 (`gnark-crypto`).
 
-Witness encryption encrypts a message directly to a mathematical statement $S$—no secret or public key pair is ever generated. Anyone holding a witness $w$ proving $S$ is true can compute the target-group key $[\kappa]_T$ from the ciphertext and decrypt; if $S$ is false, the ciphertext hides the message. While [`psivesely/praxis-lean`](https://github.com/psivesely/praxis-lean) formalizes the scheme's correctness and generic-group extractability proofs in Lean 4, it does not generate ciphertexts or execute encryption/decryption; this repository implements the full runnable algebra of Figures 9 and 10 on BN254 and verifies symbol-for-symbol exponent conformance against `praxis-lean` (see [`docs/LEAN-CONFORMANCE.md`](docs/LEAN-CONFORMANCE.md) and [`praxis/lean_conformance_test.go`](praxis/lean_conformance_test.go)).
+Witness encryption encrypts a message directly to a mathematical statement $S$—no secret or public key pair is ever generated. Anyone holding a witness $w$ proving $S$ is true can compute the target-group key $[\kappa]_T$ from the ciphertext and decrypt; if $S$ is false, the ciphertext hides the message. While [`psivesely/praxis-lean`](https://github.com/psivesely/praxis-lean) formalizes the scheme's correctness and generic-group extractability proofs in Lean 4, it does not generate ciphertexts or execute encryption/decryption; this repository implements the full runnable algebra of Figures 9 and 10 on BN254 and verifies symbol-for-symbol exponent conformance against `praxis-lean` (see [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md), [`docs/LEAN-CONFORMANCE.md`](docs/LEAN-CONFORMANCE.md), and [`praxis/lean_conformance_test.go`](praxis/lean_conformance_test.go)).
 
 > [!CAUTION]
 > **This software is an educational & research prototype and is NOT production-secure.**
@@ -345,6 +345,7 @@ What the test suite checks across all seven packages:
 | [`tui/`](tui/) | SilkCircuit-styled Charm (`bubbletea/v2` + `lipgloss/v2`) interactive workbench |
 | [`cmd/praxis/`](cmd/praxis/) | CLI entrypoint (`tui`, `bridge`, `demo`, `encrypt`, `decrypt`) |
 | [`curve/`](curve/) | Sanity checks on BN254 generators, bilinearity, and 254-bit prime order |
+| [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) | Standalone technical whitepaper covering Praxis `v0.3.2`, streaming Table-4 disk execution, compact 5×54-bit CRT Groth16 verifier BQS, and two-leaf Taproot vaults |
 | [`docs/LEAN-CONFORMANCE.md`](docs/LEAN-CONFORMANCE.md), [`praxis/lean_conformance_test.go`](praxis/lean_conformance_test.go) | Symbol-for-symbol mapping and automated $\mathbb{F}_q$ exponent conformance tests against [`psivesely/praxis-lean`](https://github.com/psivesely/praxis-lean) |
 | [`docs/demo.tape`](docs/demo.tape), [`docs/demo.gif`](docs/demo.gif) | VHS script and recorded GIF of the 6-tier spectrum slider & sweep workbench |
 | [`docs/conformance-signet.tape`](docs/conformance-signet.tape), [`docs/conformance-signet.gif`](docs/conformance-signet.gif) | VHS script and recorded GIF of the `praxis-lean` conformance suite & two-leaf `2-of-2 + CSV(6)` Signet vault |
