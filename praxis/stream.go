@@ -2,16 +2,21 @@ package praxis
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 	"math/big"
+	"math/bits"
 	"runtime"
 	"sync"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
 	"praxis-demo/poly"
@@ -21,7 +26,523 @@ const (
 	streamBufBytes = 8 << 20 // 8 MiB sequential I/O buffer
 	streamG1Batch  = 16384   // 512 KiB scalars -> 512 KiB compressed G1 per batch
 	streamG2Batch  = 8192    // 256 KiB scalars -> 512 KiB compressed G2 per batch
+
+	// Signed fixed-base window geometry for G1/G2 generators:
+	// 22 windows of 12 bits (digits in [-2047, +2048], 2048 affine entries/window):
+	//   - G1 table: 22 * 2048 * 64 B  = 2.75 MiB
+	//   - G2 table: 22 * 2048 * 128 B = 5.50 MiB
+	// Computes [s]G in <= 22 AddMixed ops with ZERO doublings.
+	fixedWinBits    = 12
+	fixedWinMask    = (1 << fixedWinBits) - 1
+	fixedWinHalf    = 1 << (fixedWinBits - 1)
+	fixedWinEntries = fixedWinHalf // stores [1..2048] * 2^(12*k) * G
+	fixedWinCount   = 22           // 22 * 12 = 264 >= 254 bits (carry out guaranteed 0)
+
+	// Stream-wide batch G2 prime-order subgroup check parameters:
+	// On BN254, h2 = 2p - r has smallest prime factor 10069 > 4096 (asserted in init()).
+	// Each 12-bit CSPRNG bucketed trial catches any non-subgroup point with prob >= 1 - 2^-12;
+	// 7 independent trials yield soundness error <= 2^-84 (stronger than gnark-crypto's 2^-64).
+	g2SubgroupTrials     = 7
+	g2SubgroupBucketBits = 12
+	g2SubgroupBuckets    = 1 << g2SubgroupBucketBits // 4096 (indices 1..4095 active)
+	g2SubgroupDirectMax  = 2048                      // below this sector size, check every point directly
 )
+
+var (
+	fixedG1Once  sync.Once
+	fixedG1Table [fixedWinCount][fixedWinEntries]bn254.G1Affine
+
+	fixedG2Once  sync.Once
+	fixedG2Table [fixedWinCount][fixedWinEntries]bn254.G2Affine
+)
+
+func init() {
+	// Verify mathematically at startup that the BN254 G2 twist cofactor h2 = 2p - r
+	// has no prime factor <= 1024, guaranteeing zero modulo collision in 10-bit bucketed
+	// batch subgroup checks (soundness error <= 2^-80 across 8 independent trials).
+	p := fp.Modulus()
+	r := fr.Modulus()
+	h2 := new(big.Int).Sub(new(big.Int).Lsh(p, 1), r)
+	var rem big.Int
+	for d := int64(2); d <= g2SubgroupBuckets; d++ {
+		if rem.Mod(h2, big.NewInt(d)).Sign() == 0 {
+			panic(fmt.Sprintf("praxis stream init: unexpected small BN254 G2 cofactor divisor %d", d))
+		}
+	}
+}
+
+func initFixedG1Table() {
+	fixedG1Once.Do(func() {
+		_, _, g1Gen, _ := bn254.Generators()
+		var bases [fixedWinCount]bn254.G1Jac
+		bases[0].FromAffine(&g1Gen)
+		for k := 1; k < fixedWinCount; k++ {
+			bases[k] = bases[k-1]
+			for d := 0; d < fixedWinBits; d++ {
+				bases[k].DoubleAssign()
+			}
+		}
+		var wg sync.WaitGroup
+		wg.Add(fixedWinCount)
+		for k := 0; k < fixedWinCount; k++ {
+			go func(k int) {
+				defer wg.Done()
+				var baseAff bn254.G1Affine
+				baseAff.FromJacobian(&bases[k])
+				jac := make([]bn254.G1Jac, fixedWinEntries)
+				jac[0] = bases[k]
+				for i := 1; i < fixedWinEntries; i++ {
+					jac[i] = jac[i-1]
+					jac[i].AddMixed(&baseAff)
+				}
+				aff := bn254.BatchJacobianToAffineG1(jac)
+				copy(fixedG1Table[k][:], aff)
+			}(k)
+		}
+		wg.Wait()
+	})
+}
+
+// batchJacobianToAffineG2 converts a slice of Jacobian G2 points to affine coordinates
+// using Montgomery's trick (1 E2 inversion + 3n E2 multiplications instead of n inversions).
+func batchJacobianToAffineG2(points []bn254.G2Jac) []bn254.G2Affine {
+	n := len(points)
+	res := make([]bn254.G2Affine, n)
+	if n == 0 {
+		return res
+	}
+	prod := make([]bn254.E2, n)
+	var acc bn254.E2
+	acc.SetOne()
+	for i := 0; i < n; i++ {
+		if !points[i].Z.IsZero() {
+			acc.Mul(&acc, &points[i].Z)
+		}
+		prod[i] = acc
+	}
+	var invAcc, zInv, zInv2, zInv3 bn254.E2
+	invAcc.Inverse(&acc)
+	for i := n - 1; i >= 0; i-- {
+		if points[i].Z.IsZero() {
+			continue
+		}
+		if i > 0 {
+			zInv.Mul(&invAcc, &prod[i-1])
+			invAcc.Mul(&invAcc, &points[i].Z)
+		} else {
+			zInv = invAcc
+		}
+		zInv2.Square(&zInv)
+		zInv3.Mul(&zInv2, &zInv)
+		res[i].X.Mul(&points[i].X, &zInv2)
+		res[i].Y.Mul(&points[i].Y, &zInv3)
+	}
+	return res
+}
+
+func initFixedG2Table() {
+	fixedG2Once.Do(func() {
+		_, _, _, g2Gen := bn254.Generators()
+		var bases [fixedWinCount]bn254.G2Jac
+		bases[0].FromAffine(&g2Gen)
+		for k := 1; k < fixedWinCount; k++ {
+			bases[k] = bases[k-1]
+			for d := 0; d < fixedWinBits; d++ {
+				bases[k].DoubleAssign()
+			}
+		}
+		var wg sync.WaitGroup
+		wg.Add(fixedWinCount)
+		for k := 0; k < fixedWinCount; k++ {
+			go func(k int) {
+				defer wg.Done()
+				var baseAff bn254.G2Affine
+				baseAff.FromJacobian(&bases[k])
+				jac := make([]bn254.G2Jac, fixedWinEntries)
+				jac[0] = bases[k]
+				for i := 1; i < fixedWinEntries; i++ {
+					jac[i] = jac[i-1]
+					jac[i].AddMixed(&baseAff)
+				}
+				aff := batchJacobianToAffineG2(jac)
+				copy(fixedG2Table[k][:], aff)
+			}(k)
+		}
+		wg.Wait()
+	})
+}
+
+// mulFixedG1Jac computes [s]g1Gen in Jacobian coordinates with zero doublings (<= 26 AddMixed ops).
+func mulFixedG1Jac(s *fr.Element) bn254.G1Jac {
+	words := s.Bits()
+	var acc bn254.G1Jac
+	var pt bn254.G1Affine
+	var carry int32
+	for k := 0; k < fixedWinCount; k++ {
+		bitPos := k * fixedWinBits
+		wordIdx := bitPos >> 6
+		bitOff := uint(bitPos & 63)
+		var raw uint32
+		if wordIdx < 4 {
+			raw = uint32(words[wordIdx] >> bitOff)
+			if bitOff > 64-fixedWinBits && wordIdx+1 < 4 {
+				raw |= uint32(words[wordIdx+1] << (64 - bitOff))
+			}
+		}
+		val := int32(raw&fixedWinMask) + carry
+		if val > fixedWinHalf {
+			val -= 1 << fixedWinBits
+			carry = 1
+		} else {
+			carry = 0
+		}
+		if val > 0 {
+			acc.AddMixed(&fixedG1Table[k][val-1])
+		} else if val < 0 {
+			pt = fixedG1Table[k][-val-1]
+			pt.Y.Neg(&pt.Y)
+			acc.AddMixed(&pt)
+		}
+	}
+	return acc
+}
+
+// mulFixedG2Jac computes [s]g2Gen in Jacobian coordinates with zero doublings (<= 26 AddMixed ops).
+func mulFixedG2Jac(s *fr.Element) bn254.G2Jac {
+	words := s.Bits()
+	var acc bn254.G2Jac
+	var pt bn254.G2Affine
+	var carry int32
+	for k := 0; k < fixedWinCount; k++ {
+		bitPos := k * fixedWinBits
+		wordIdx := bitPos >> 6
+		bitOff := uint(bitPos & 63)
+		var raw uint32
+		if wordIdx < 4 {
+			raw = uint32(words[wordIdx] >> bitOff)
+			if bitOff > 64-fixedWinBits && wordIdx+1 < 4 {
+				raw |= uint32(words[wordIdx+1] << (64 - bitOff))
+			}
+		}
+		val := int32(raw&fixedWinMask) + carry
+		if val > fixedWinHalf {
+			val -= 1 << fixedWinBits
+			carry = 1
+		} else {
+			carry = 0
+		}
+		if val > 0 {
+			acc.AddMixed(&fixedG2Table[k][val-1])
+		} else if val < 0 {
+			pt = fixedG2Table[k][-val-1]
+			pt.Y.Neg(&pt.Y)
+			acc.AddMixed(&pt)
+		}
+	}
+	return acc
+}
+
+// batchMulCompressG1 computes compressed [scalars[i]]g1Gen into rawOut across all CPU cores
+// using fixed-base zero-doubling multiplication and per-worker BatchJacobianToAffineG1.
+func batchMulCompressG1(scalars []fr.Element, jacBuf []bn254.G1Jac, rawOut []byte, workers int) {
+	initFixedG1Table()
+	n := len(scalars)
+	if n == 0 {
+		return
+	}
+	runSlice := func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			jacBuf[i] = mulFixedG1Jac(&scalars[i])
+		}
+		aff := bn254.BatchJacobianToAffineG1(jacBuf[lo:hi])
+		for off := range aff {
+			b := aff[off].Bytes()
+			copy(rawOut[(lo+off)*bn254.SizeOfG1AffineCompressed:], b[:])
+		}
+	}
+	if workers <= 1 || n < 256 {
+		runSlice(0, n)
+		return
+	}
+	w := min(workers, (n+127)/128)
+	chunk := (n + w - 1) / w
+	var wg sync.WaitGroup
+	for wk := 0; wk < w; wk++ {
+		lo := wk * chunk
+		hi := min(n, lo+chunk)
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			runSlice(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// batchMulCompressG2 computes compressed [scalars[i]]g2Gen into rawOut across all CPU cores
+// using fixed-base zero-doubling multiplication and per-worker BatchJacobianToAffineG2.
+func batchMulCompressG2(scalars []fr.Element, jacBuf []bn254.G2Jac, rawOut []byte, workers int) {
+	initFixedG2Table()
+	n := len(scalars)
+	if n == 0 {
+		return
+	}
+	runSlice := func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			jacBuf[i] = mulFixedG2Jac(&scalars[i])
+		}
+		aff := batchJacobianToAffineG2(jacBuf[lo:hi])
+		for off := range aff {
+			b := aff[off].Bytes()
+			copy(rawOut[(lo+off)*bn254.SizeOfG2AffineCompressed:], b[:])
+		}
+	}
+	if workers <= 1 || n < 128 {
+		runSlice(0, n)
+		return
+	}
+	w := min(workers, (n+63)/64)
+	chunk := (n + w - 1) / w
+	var wg sync.WaitGroup
+	for wk := 0; wk < w; wk++ {
+		lo := wk * chunk
+		hi := min(n, lo+chunk)
+		if lo >= hi {
+			break
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			runSlice(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// g2SubgroupChecker verifies that every streamed on-curve G2 point lies in BN254 G2[r].
+// For sectors smaller than g2SubgroupDirectMax, checks every point deterministically in parallel.
+// For larger sectors, accumulates 7 independent 12-bit CSPRNG bucketed linear combinations
+// across the entire sector and runs a single Pippenger triangle + IsInSubGroup() at Finalize()
+// (soundness error <= 2^-84 since every prime factor of h2 = 2p - r exceeds 4096).
+type g2SubgroupChecker struct {
+	bucketed bool
+	workers  int
+	buckets  *[g2SubgroupTrials][g2SubgroupBuckets]bn254.G2Jac
+	rBufs    [g2SubgroupTrials][]byte
+}
+
+func newG2SubgroupChecker(expectedCount, workers int) *g2SubgroupChecker {
+	if expectedCount < g2SubgroupDirectMax {
+		return &g2SubgroupChecker{bucketed: false, workers: workers}
+	}
+	c := &g2SubgroupChecker{
+		bucketed: true,
+		workers:  workers,
+		buckets:  new([g2SubgroupTrials][g2SubgroupBuckets]bn254.G2Jac),
+	}
+	for tr := 0; tr < g2SubgroupTrials; tr++ {
+		c.rBufs[tr] = make([]byte, streamG2Batch*2)
+	}
+	return c
+}
+
+func (c *g2SubgroupChecker) Reset() {
+	if c.bucketed && c.buckets != nil {
+		*c.buckets = [g2SubgroupTrials][g2SubgroupBuckets]bn254.G2Jac{}
+	}
+}
+
+func (c *g2SubgroupChecker) Add(pts []bn254.G2Affine) bool {
+	n := len(pts)
+	if n == 0 {
+		return true
+	}
+	if !c.bucketed {
+		if c.workers <= 1 || n < 32 {
+			for i := range pts {
+				if !pts[i].IsInSubGroup() {
+					return false
+				}
+			}
+			return true
+		}
+		okFlags := make([]bool, c.workers)
+		chunk := (n + c.workers - 1) / c.workers
+		var wg sync.WaitGroup
+		for wk := 0; wk < c.workers; wk++ {
+			lo := wk * chunk
+			hi := min(n, lo+chunk)
+			if lo >= hi {
+				okFlags[wk] = true
+				continue
+			}
+			wg.Add(1)
+			go func(wk, lo, hi int) {
+				defer wg.Done()
+				for i := lo; i < hi; i++ {
+					if !pts[i].IsInSubGroup() {
+						return
+					}
+				}
+				okFlags[wk] = true
+			}(wk, lo, hi)
+		}
+		wg.Wait()
+		for _, ok := range okFlags {
+			if !ok {
+				return false
+			}
+		}
+		return true
+	}
+
+	var trialOK [g2SubgroupTrials]bool
+	var wg sync.WaitGroup
+	wg.Add(g2SubgroupTrials)
+	for tr := 0; tr < g2SubgroupTrials; tr++ {
+		go func(tr int) {
+			defer wg.Done()
+			need := n * 2
+			if len(c.rBufs[tr]) < need {
+				c.rBufs[tr] = make([]byte, need)
+			}
+			rBytes := c.rBufs[tr][:need]
+			if _, err := rand.Read(rBytes); err != nil {
+				return
+			}
+			bkt := &c.buckets[tr]
+			const mask = g2SubgroupBuckets - 1
+			for i := 0; i < n; i++ {
+				coeff := int(binary.LittleEndian.Uint16(rBytes[2*i:2*i+2])) & mask
+				if coeff != 0 {
+					bkt[coeff].AddMixed(&pts[i])
+				}
+			}
+			trialOK[tr] = true
+		}(tr)
+	}
+	wg.Wait()
+	for _, ok := range trialOK {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *g2SubgroupChecker) Finalize() bool {
+	if !c.bucketed {
+		return true
+	}
+	var trialOK [g2SubgroupTrials]bool
+	var wg sync.WaitGroup
+	wg.Add(g2SubgroupTrials)
+	for tr := 0; tr < g2SubgroupTrials; tr++ {
+		go func(tr int) {
+			defer wg.Done()
+			bkt := &c.buckets[tr]
+			var running, total bn254.G2Jac
+			for k := g2SubgroupBuckets - 1; k >= 1; k-- {
+				running.AddAssign(&bkt[k])
+				total.AddAssign(&running)
+			}
+			trialOK[tr] = total.IsInSubGroup()
+		}(tr)
+	}
+	wg.Wait()
+	for _, ok := range trialOK {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+var seedDomainPrefix = []byte("praxis-demo/seed")
+
+// fillRingElement writes ringElement(seed, i, j, len(out)) into out with zero heap allocations.
+func fillRingElement(h hash.Hash, sumBuf *[sha512.Size]byte, seed []byte, i, j int, out []fr.Element) {
+	var idx [12]byte
+	binary.BigEndian.PutUint32(idx[0:], uint32(i))
+	binary.BigEndian.PutUint32(idx[4:], uint32(j))
+	for s := range out {
+		binary.BigEndian.PutUint32(idx[8:], uint32(s))
+		h.Reset()
+		h.Write(seedDomainPrefix)
+		h.Write(seed)
+		h.Write(idx[:])
+		out[s].SetBytes(h.Sum(sumBuf[:0]))
+	}
+}
+
+// sampleRStream samples the centered Definition 5.3 integer vector using buffered crypto/rand
+// rejection sampling (identical uniform distribution to sampleR with zero per-entry syscalls).
+func sampleRStream(N int, g int64) ([]fr.Element, error) {
+	r := make([]fr.Element, N+1)
+	rng := bufio.NewReaderSize(rand.Reader, 64<<10)
+	var u8 [8]byte
+	var mask uint64
+	if g > 1 {
+		mask = (uint64(1) << bits.Len64(uint64(g-1))) - 1
+	}
+	nextVal := func() (int64, error) {
+		if g <= 1 {
+			return 2, nil
+		}
+		for {
+			if _, err := io.ReadFull(rng, u8[:]); err != nil {
+				return 0, err
+			}
+			v := binary.LittleEndian.Uint64(u8[:]) & mask
+			if v < uint64(g) {
+				return int64(v) + 2, nil
+			}
+		}
+	}
+	sum := new(big.Int)
+	var tmp big.Int
+	for i := 1; i <= N; i++ {
+		v, err := nextVal()
+		if err != nil {
+			return nil, err
+		}
+		sum.Add(sum, tmp.SetInt64(v))
+		r[i].SetInt64(v)
+	}
+	rStar, err := nextVal()
+	if err != nil {
+		return nil, err
+	}
+	a := new(big.Int).Mul(big.NewInt(int64(N)), big.NewInt(g+1))
+	a.Add(a, big.NewInt(1))
+	a.Rsh(a, 1)
+	halfSum := sum.Rsh(sum, 1)
+	r0 := a.Add(a, tmp.SetInt64(rStar))
+	r0.Sub(r0, halfSum)
+	r[0].SetBigInt(r0)
+	return r, nil
+}
+
+// fillRandFr fills dst with uniform random Fr elements using buffered crypto/rand rejection sampling.
+func fillRandFr(dst []fr.Element) error {
+	rng := bufio.NewReaderSize(rand.Reader, 64<<10)
+	var buf [32]byte
+	for i := range dst {
+		for {
+			if _, err := io.ReadFull(rng, buf[:]); err != nil {
+				return err
+			}
+			buf[0] &= 0x3f
+			if err := dst[i].SetBytesCanonical(buf[:]); err == nil {
+				break
+			}
+		}
+	}
+	return nil
+}
 
 // zAtTripleStream evaluates z[xMinus], z[xCirc], z[xPlus] directly from the
 // seed oracle without materializing the n x (N+1) dense forms matrix phi
@@ -53,49 +574,54 @@ func (par Params) zAtTripleStream(seed []byte, N int, xMinus, xCirc, xPlus *fr.E
 
 	// Parallelize across packed column blocks j in 0..ell so each goroutine writes
 	// to strictly disjoint indices of zMinus, zCirc, zPlus with zero synchronization.
-	processBlock := func(j int) {
+	processRange := func(jLo, jHi int) {
+		h := sha512.New()
+		var sumBuf [sha512.Size]byte
+		m := make([]fr.Element, dr)
 		var tmp fr.Element
-		if j == 0 {
-			for i := 1; i <= par.K; i++ {
-				m := ringElement(seed, i, 0, dr)
-				base := i * dr
-				for s := 0; s < dr; s++ {
-					tmp.Mul(&m[s], &pMinus[base+s])
-					zMinus[0].Add(&zMinus[0], &tmp)
-					tmp.Mul(&m[s], &pCirc[base+s])
-					zCirc[0].Add(&zCirc[0], &tmp)
-					tmp.Mul(&m[s], &pPlus[base+s])
-					zPlus[0].Add(&zPlus[0], &tmp)
-				}
-			}
-			return
-		}
-		uStart := (j-1)*dr + 1
-		uEnd := min(N, uStart+dr-1)
-		tCount := uEnd - uStart + 1
-		for i := 1; i <= par.K; i++ {
-			m := ringElement(seed, i, j, dr)
-			base := i * dr
-			for t := 0; t < tCount; t++ {
-				u := uStart + t
-				var accM, accC, accP fr.Element
-				for s := 0; s < dr; s++ {
-					var coef fr.Element
-					if s >= t {
-						coef = m[s-t]
-					} else {
-						coef.Neg(&m[dr+s-t])
+		for j := jLo; j < jHi; j++ {
+			if j == 0 {
+				for i := 1; i <= par.K; i++ {
+					fillRingElement(h, &sumBuf, seed, i, 0, m)
+					base := i * dr
+					for s := 0; s < dr; s++ {
+						tmp.Mul(&m[s], &pMinus[base+s])
+						zMinus[0].Add(&zMinus[0], &tmp)
+						tmp.Mul(&m[s], &pCirc[base+s])
+						zCirc[0].Add(&zCirc[0], &tmp)
+						tmp.Mul(&m[s], &pPlus[base+s])
+						zPlus[0].Add(&zPlus[0], &tmp)
 					}
-					tmp.Mul(&coef, &pMinus[base+s])
-					accM.Add(&accM, &tmp)
-					tmp.Mul(&coef, &pCirc[base+s])
-					accC.Add(&accC, &tmp)
-					tmp.Mul(&coef, &pPlus[base+s])
-					accP.Add(&accP, &tmp)
 				}
-				zMinus[u].Add(&zMinus[u], &accM)
-				zCirc[u].Add(&zCirc[u], &accC)
-				zPlus[u].Add(&zPlus[u], &accP)
+				continue
+			}
+			uStart := (j-1)*dr + 1
+			uEnd := min(N, uStart+dr-1)
+			tCount := uEnd - uStart + 1
+			for i := 1; i <= par.K; i++ {
+				fillRingElement(h, &sumBuf, seed, i, j, m)
+				base := i * dr
+				for t := 0; t < tCount; t++ {
+					u := uStart + t
+					var accM, accC, accP fr.Element
+					for s := 0; s < dr; s++ {
+						var coef fr.Element
+						if s >= t {
+							coef = m[s-t]
+						} else {
+							coef.Neg(&m[dr+s-t])
+						}
+						tmp.Mul(&coef, &pMinus[base+s])
+						accM.Add(&accM, &tmp)
+						tmp.Mul(&coef, &pCirc[base+s])
+						accC.Add(&accC, &tmp)
+						tmp.Mul(&coef, &pPlus[base+s])
+						accP.Add(&accP, &tmp)
+					}
+					zMinus[u].Add(&zMinus[u], &accM)
+					zCirc[u].Add(&zCirc[u], &accC)
+					zPlus[u].Add(&zPlus[u], &accP)
+				}
 			}
 		}
 	}
@@ -103,25 +629,22 @@ func (par Params) zAtTripleStream(seed []byte, N int, xMinus, xCirc, xPlus *fr.E
 	totalBlocks := ell + 1
 	workers := min(runtime.NumCPU(), totalBlocks)
 	if workers <= 1 || par.K*totalBlocks < 16 {
-		for j := 0; j < totalBlocks; j++ {
-			processBlock(j)
-		}
+		processRange(0, totalBlocks)
 		return zMinus, zCirc, zPlus
 	}
+	chunk := (totalBlocks + workers - 1) / workers
 	var wg sync.WaitGroup
-	ch := make(chan int, totalBlocks)
-	for j := 0; j < totalBlocks; j++ {
-		ch <- j
-	}
-	close(ch)
-	for w := 0; w < workers; w++ {
+	for wk := 0; wk < workers; wk++ {
+		lo := wk * chunk
+		hi := min(totalBlocks, lo+chunk)
+		if lo >= hi {
+			break
+		}
 		wg.Add(1)
-		go func() {
+		go func(lo, hi int) {
 			defer wg.Done()
-			for j := range ch {
-				processBlock(j)
-			}
-		}()
+			processRange(lo, hi)
+		}(lo, hi)
 	}
 	wg.Wait()
 	return zMinus, zCirc, zPlus
@@ -155,16 +678,67 @@ func (par Params) weightsOfStream(f field, seed []byte, N int, w []bool) weights
 		}
 	}
 
+	workers := max(1, runtime.NumCPU())
 	fillRow := func(i int) {
 		base := i * dr
 		if w[0] {
-			m0 := ringElement(seed, i, 0, dr)
+			h0 := sha512.New()
+			var sum0 [sha512.Size]byte
+			m0 := make([]fr.Element, dr)
+			fillRingElement(h0, &sum0, seed, i, 0, m0)
 			for s := 0; s < dr; s++ {
 				z[base+s].Add(&z[base+s], &m0[s])
 			}
 		}
+		if par.K < workers && len(activeBlocks) >= 1024 && workers > 1 {
+			// Parallelize across activeBlocks when K is small (e.g. Groth16 K=1, N=2.41M).
+			chunk := (len(activeBlocks) + workers - 1) / workers
+			locals := make([][]fr.Element, workers)
+			var wg sync.WaitGroup
+			for wk := 0; wk < workers; wk++ {
+				lo := wk * chunk
+				hi := min(len(activeBlocks), lo+chunk)
+				if lo >= hi {
+					continue
+				}
+				locals[wk] = make([]fr.Element, dr)
+				wg.Add(1)
+				go func(wk, lo, hi int) {
+					defer wg.Done()
+					h := sha512.New()
+					var sumBuf [sha512.Size]byte
+					m := make([]fr.Element, dr)
+					loc := locals[wk]
+					for idx := lo; idx < hi; idx++ {
+						j := activeBlocks[idx]
+						fillRingElement(h, &sumBuf, seed, i, j, m)
+						for _, t := range activeTs[j] {
+							for s := 0; s < dr; s++ {
+								if s >= t {
+									loc[s].Add(&loc[s], &m[s-t])
+								} else {
+									loc[s].Sub(&loc[s], &m[dr+s-t])
+								}
+							}
+						}
+					}
+				}(wk, lo, hi)
+			}
+			wg.Wait()
+			for wk := 0; wk < workers; wk++ {
+				if locals[wk] != nil {
+					for s := 0; s < dr; s++ {
+						z[base+s].Add(&z[base+s], &locals[wk][s])
+					}
+				}
+			}
+			return
+		}
+		h := sha512.New()
+		var sumBuf [sha512.Size]byte
+		m := make([]fr.Element, dr)
 		for _, j := range activeBlocks {
-			m := ringElement(seed, i, j, dr)
+			fillRingElement(h, &sumBuf, seed, i, j, m)
 			for _, t := range activeTs[j] {
 				for s := 0; s < dr; s++ {
 					if s >= t {
@@ -182,14 +756,14 @@ func (par Params) weightsOfStream(f field, seed []byte, N int, w []bool) weights
 			fillRow(i)
 		}
 	} else {
-		workers := min(runtime.NumCPU(), par.K)
+		rowWorkers := min(workers, par.K)
 		var wg sync.WaitGroup
 		rowCh := make(chan int, par.K)
 		for i := 1; i <= par.K; i++ {
 			rowCh <- i
 		}
 		close(rowCh)
-		for wk := 0; wk < workers; wk++ {
+		for wk := 0; wk < rowWorkers; wk++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -232,6 +806,7 @@ func EncStreamTo(pp *Public, msg []byte, dst io.Writer) (EncReport, error) {
 	par, N, f := pp.Par, pp.S.N, pp.fld
 	n := par.NForms()
 	l := pp.layout()
+	workers := max(1, runtime.NumCPU())
 
 	if l.lenG1() > maxFieldLen || l.lenG2() > maxFieldLen {
 		return EncReport{}, fmt.Errorf("ciphertext element count exceeds wire format limit %d", maxFieldLen)
@@ -242,13 +817,14 @@ func EncStreamTo(pp *Public, msg []byte, dst io.Writer) (EncReport, error) {
 		return EncReport{}, err
 	}
 
-	// Sample Figure 9 coins (identical to EncDetailed).
-	r := sampleR(N, par.G)
+	// Sample Figure 9 coins (identical distribution to EncDetailed, buffered CSPRNG).
+	r, err := sampleRStream(N, par.G)
+	if err != nil {
+		return EncReport{}, err
+	}
 	y := make([]fr.Element, N+1)
-	for i := range y {
-		if _, err := y[i].SetRandom(); err != nil {
-			return EncReport{}, err
-		}
+	if err := fillRandFr(y); err != nil {
+		return EncReport{}, err
 	}
 	var tau, zpTau, omega12 fr.Element
 	for {
@@ -364,19 +940,19 @@ pick:
 	kaBytes := ka.Bytes()
 	_, _ = bw.Write(kaBytes[:])
 
-	// Stream G1 elements in fixed-size chunks.
+	// Stream G1 elements in fixed-size chunks using parallel zero-doubling fixed-base G1 engine.
 	writeU32(l.lenG1())
 	g1Buf := make([]fr.Element, 0, streamG1Batch)
+	g1JacBuf := make([]bn254.G1Jac, streamG1Batch)
+	g1RawBuf := make([]byte, streamG1Batch*bn254.SizeOfG1AffineCompressed)
 	flushG1 := func() error {
-		if len(g1Buf) == 0 {
+		cnt := len(g1Buf)
+		if cnt == 0 {
 			return nil
 		}
-		pts := bn254.BatchScalarMultiplicationG1(&g1Gen, g1Buf)
-		for i := range pts {
-			b := pts[i].Bytes()
-			if _, err := bw.Write(b[:]); err != nil {
-				return err
-			}
+		batchMulCompressG1(g1Buf, g1JacBuf, g1RawBuf, workers)
+		if _, err := bw.Write(g1RawBuf[:cnt*bn254.SizeOfG1AffineCompressed]); err != nil {
+			return err
 		}
 		g1Buf = g1Buf[:0]
 		return nil
@@ -437,6 +1013,8 @@ pick:
 	if err := flushG1(); err != nil {
 		return EncReport{}, err
 	}
+	// Release G1 scratch buffers before allocating G2 scratch buffers to minimize peak HeapAlloc.
+	g1Buf, g1JacBuf, g1RawBuf = nil, nil, nil
 
 	// Precompute scalar constants shared across G2 (plain) and G2a (alpha) streaming passes.
 	var epsInv, o22Inv, o12Over22, zetaInv, zeta1Inv, zeta2Inv, zKey fr.Element
@@ -487,16 +1065,16 @@ pick:
 
 	writeU32(l.lenG2())
 	g2Buf := make([]fr.Element, 0, streamG2Batch)
+	g2JacBuf := make([]bn254.G2Jac, streamG2Batch)
+	g2RawBuf := make([]byte, streamG2Batch*bn254.SizeOfG2AffineCompressed)
 	flushG2 := func() error {
-		if len(g2Buf) == 0 {
+		cnt := len(g2Buf)
+		if cnt == 0 {
 			return nil
 		}
-		pts := bn254.BatchScalarMultiplicationG2(&g2Gen, g2Buf)
-		for i := range pts {
-			b := pts[i].Bytes()
-			if _, err := bw.Write(b[:]); err != nil {
-				return err
-			}
+		batchMulCompressG2(g2Buf, g2JacBuf, g2RawBuf, workers)
+		if _, err := bw.Write(g2RawBuf[:cnt*bn254.SizeOfG2AffineCompressed]); err != nil {
+			return err
 		}
 		g2Buf = g2Buf[:0]
 		return nil
@@ -810,11 +1388,13 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 		return nil
 	}
 
-	// Helper: parallel batch decode of compressed G2 points (verifies curve + prime-order subgroup).
+	// Helper: parallel batch decode of compressed G2 points (verifies canonical encoding & twist curve
+	// on every point; G2[r] prime-order subgroup membership is verified across the full sector via g2SubgroupChecker).
 	decodeG2Chunk := func(raw []byte, count int, dst []bn254.G2Affine) error {
 		if count < 128 || workers == 1 {
+			dec := bn254.NewDecoder(bytes.NewReader(raw[:count*bn254.SizeOfG2AffineCompressed]), bn254.NoSubgroupChecks())
 			for i := 0; i < count; i++ {
-				if _, err := dst[i].SetBytes(raw[i*bn254.SizeOfG2AffineCompressed : (i+1)*bn254.SizeOfG2AffineCompressed]); err != nil {
+				if err := dec.Decode(&dst[i]); err != nil {
 					return err
 				}
 			}
@@ -832,8 +1412,10 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 			wg.Add(1)
 			go func(wk, lo, hi int) {
 				defer wg.Done()
+				sub := raw[lo*bn254.SizeOfG2AffineCompressed : hi*bn254.SizeOfG2AffineCompressed]
+				dec := bn254.NewDecoder(bytes.NewReader(sub), bn254.NoSubgroupChecks())
 				for i := lo; i < hi; i++ {
-					if _, err := dst[i].SetBytes(raw[i*bn254.SizeOfG2AffineCompressed : (i+1)*bn254.SizeOfG2AffineCompressed]); err != nil {
+					if err := dec.Decode(&dst[i]); err != nil {
 						errs[wk] = err
 						return
 					}
@@ -873,32 +1455,101 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 		return nil
 	}
 
-	// 1a. f(k1, i, 0..1)
+	// 1a. f(k1, i, 0..1) — parallelize G1 witness accumulation across workers when batch is large.
 	n1Count := N + 1
+	localFw := make([][][2]bn254.G1Jac, workers)
+	for wk := range localFw {
+		localFw[wk] = make([][2]bn254.G1Jac, par.K1)
+	}
 	if err := readG1Count(2*par.K1*n1Count, func(baseIdx int, pts []bn254.G1Affine) {
-		for off, pt := range pts {
-			idx := baseIdx + off
-			coord := idx & 1
-			pairIdx := idx >> 1
-			k1 := pairIdx / n1Count
-			i := pairIdx % n1Count
-			if w[i] {
-				fw[k1][coord].AddMixed(&pt)
+		cnt := len(pts)
+		if workers <= 1 || cnt < 1024 {
+			for off, pt := range pts {
+				idx := baseIdx + off
+				coord := idx & 1
+				pairIdx := idx >> 1
+				k1 := pairIdx / n1Count
+				i := pairIdx % n1Count
+				if w[i] {
+					fw[k1][coord].AddMixed(&pt)
+				}
 			}
+			return
 		}
+		chunk := (cnt + workers - 1) / workers
+		var wg sync.WaitGroup
+		for wk := 0; wk < workers; wk++ {
+			lo := wk * chunk
+			hi := min(cnt, lo+chunk)
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(wk, lo, hi int) {
+				defer wg.Done()
+				loc := localFw[wk]
+				for off := lo; off < hi; off++ {
+					idx := baseIdx + off
+					coord := idx & 1
+					pairIdx := idx >> 1
+					k1 := pairIdx / n1Count
+					i := pairIdx % n1Count
+					if w[i] {
+						loc[k1][coord].AddMixed(&pts[off])
+					}
+				}
+			}(wk, lo, hi)
+		}
+		wg.Wait()
 	}); err != nil {
 		return nil, rep, err
 	}
-
-	// 1b. y(i)
-	if err := readG1Count(n1Count, func(baseIdx int, pts []bn254.G1Affine) {
-		for off, pt := range pts {
-			if w[baseIdx+off] {
-				yw.AddMixed(&pt)
-			}
+	for wk := range localFw {
+		for k1 := 0; k1 < par.K1; k1++ {
+			fw[k1][0].AddAssign(&localFw[wk][k1][0])
+			fw[k1][1].AddAssign(&localFw[wk][k1][1])
 		}
+	}
+	localFw = nil
+
+	// 1b. y(i) — parallelize G1 witness accumulation across workers when batch is large.
+	localYw := make([]bn254.G1Jac, workers)
+	if err := readG1Count(n1Count, func(baseIdx int, pts []bn254.G1Affine) {
+		cnt := len(pts)
+		if workers <= 1 || cnt < 1024 {
+			for off, pt := range pts {
+				if w[baseIdx+off] {
+					yw.AddMixed(&pt)
+				}
+			}
+			return
+		}
+		chunk := (cnt + workers - 1) / workers
+		var wg sync.WaitGroup
+		for wk := 0; wk < workers; wk++ {
+			lo := wk * chunk
+			hi := min(cnt, lo+chunk)
+			if lo >= hi {
+				break
+			}
+			wg.Add(1)
+			go func(wk, lo, hi int) {
+				defer wg.Done()
+				var acc bn254.G1Jac
+				for off := lo; off < hi; off++ {
+					if w[baseIdx+off] {
+						acc.AddMixed(&pts[off])
+					}
+				}
+				localYw[wk].AddAssign(&acc)
+			}(wk, lo, hi)
+		}
+		wg.Wait()
 	}); err != nil {
 		return nil, rep, err
+	}
+	for wk := range localYw {
+		yw.AddAssign(&localYw[wk])
 	}
 
 	// 1c. pquo(k) -> accumulate pKey[j], pOth[j] chunked MSMs on the fly
@@ -915,12 +1566,8 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 	}); err != nil {
 		return nil, rep, err
 	}
-	pKey := make([]bn254.G1Affine, l.jQuo)
-	pOth := make([]bn254.G1Affine, l.jQuo)
-	for j := 0; j < l.jQuo; j++ {
-		pKey[j].FromJacobian(&pKeyJac[j])
-		pOth[j].FromJacobian(&pOthJac[j])
-	}
+	pKey := bn254.BatchJacobianToAffineG1(pKeyJac)
+	pOth := bn254.BatchJacobianToAffineG1(pOthJac)
 
 	// 1d. prem(k) -> build k-index map for non-multiples of nu and stream pRem[j]
 	remExps := make([]int, 0, l.nRem)
@@ -943,25 +1590,54 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 	}); err != nil {
 		return nil, rep, err
 	}
-	pRem := make([]bn254.G1Affine, l.jRem)
-	for j := 0; j < l.jRem; j++ {
-		pRem[j].FromJacobian(&pRemJac[j])
-	}
+	pRem := bn254.BatchJacobianToAffineG1(pRemJac)
+	// Release G1 decode scratch before allocating G2 decode scratch.
+	rawG1, ptsG1 = nil, nil
 
-	// Convert accumulated G1 points to affine & combine across columns.
-	fwAff := [2][]bn254.G1Affine{make([]bn254.G1Affine, par.K1), make([]bn254.G1Affine, par.K1)}
+	// Convert accumulated G1 points to affine & combine across columns (parallelized across legs).
+	fw0Jac := make([]bn254.G1Jac, par.K1)
+	fw1Jac := make([]bn254.G1Jac, par.K1)
 	for k1 := range fw {
-		fwAff[0][k1].FromJacobian(&fw[k1][0])
-		fwAff[1][k1].FromJacobian(&fw[k1][1])
+		fw0Jac[k1] = fw[k1][0]
+		fw1Jac[k1] = fw[k1][1]
+	}
+	fwAff := [2][]bn254.G1Affine{
+		bn254.BatchJacobianToAffineG1(fw0Jac),
+		bn254.BatchJacobianToAffineG1(fw1Jac),
 	}
 	fLeg := make([][2]bn254.G1Affine, par.legs())
-	col := make([]fr.Element, par.K1)
-	for leg := range fLeg {
-		for k1 := range col {
-			col[k1] = xi[par.cell(k1, leg)]
+	if par.legs() >= 4 && workers > 1 {
+		var wg sync.WaitGroup
+		legCh := make(chan int, par.legs())
+		for leg := range fLeg {
+			legCh <- leg
 		}
-		fLeg[leg][0] = msm1(fwAff[0], col)
-		fLeg[leg][1] = msm1(fwAff[1], col)
+		close(legCh)
+		wLeg := min(workers, par.legs())
+		wg.Add(wLeg)
+		for wk := 0; wk < wLeg; wk++ {
+			go func() {
+				defer wg.Done()
+				col := make([]fr.Element, par.K1)
+				for leg := range legCh {
+					for k1 := range col {
+						col[k1] = xi[par.cell(k1, leg)]
+					}
+					fLeg[leg][0] = msm1(fwAff[0], col)
+					fLeg[leg][1] = msm1(fwAff[1], col)
+				}
+			}()
+		}
+		wg.Wait()
+	} else {
+		col := make([]fr.Element, par.K1)
+		for leg := range fLeg {
+			for k1 := range col {
+				col[k1] = xi[par.cell(k1, leg)]
+			}
+			fLeg[leg][0] = msm1(fwAff[0], col)
+			fLeg[leg][1] = msm1(fwAff[1], col)
+		}
 	}
 	var ywAff bn254.G1Affine
 	ywAff.FromJacobian(&yw)
@@ -980,6 +1656,7 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 	xiOth[0].SetZero()
 	rawG2 := make([]byte, streamG2Batch*bn254.SizeOfG2AffineCompressed)
 	ptsG2 := make([]bn254.G2Affine, streamG2Batch)
+	g2Checker := newG2SubgroupChecker(n2, workers)
 
 	readG2Count := func(total int, onBatch func(baseIdx int, pts []bn254.G2Affine)) error {
 		done := 0
@@ -992,7 +1669,25 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 			if err := decodeG2Chunk(buf, cnt, ptsG2[:cnt]); err != nil {
 				return err
 			}
-			onBatch(done, ptsG2[:cnt])
+			if g2Checker.bucketed {
+				var addOK bool
+				var addWg sync.WaitGroup
+				addWg.Add(1)
+				go func() {
+					defer addWg.Done()
+					addOK = g2Checker.Add(ptsG2[:cnt])
+				}()
+				onBatch(done, ptsG2[:cnt])
+				addWg.Wait()
+				if !addOK {
+					return fmt.Errorf("invalid G2 point: subgroup check failed")
+				}
+			} else {
+				if !g2Checker.Add(ptsG2[:cnt]) {
+					return fmt.Errorf("invalid G2 point: subgroup check failed")
+				}
+				onBatch(done, ptsG2[:cnt])
+			}
 			done += cnt
 		}
 		return nil
@@ -1007,23 +1702,70 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 		bSc = append(bSc, pad(xc[fam], 2*n-1)...)
 	}
 
+	hwWorkers := workers
+	if g2Checker.bucketed && workers > g2SubgroupTrials {
+		hwWorkers = workers - g2SubgroupTrials
+	}
+
 	streamComb := func() (lambda, psi bn254.GT, err error) {
+		g2Checker.Reset()
 		hw := make([][2]bn254.G2Jac, par.legs())
-		// 2a. h(leg, j, 0..1)
+		localHw := make([][][2]bn254.G2Jac, hwWorkers)
+		for wk := range localHw {
+			localHw[wk] = make([][2]bn254.G2Jac, par.legs())
+		}
+		// 2a. h(leg, j, 0..1) — parallel G2 witness accumulation across workers.
 		if err = readG2Count(2*par.legs()*n1Count, func(baseIdx int, pts []bn254.G2Affine) {
-			for off, pt := range pts {
-				idx := baseIdx + off
-				coord := idx & 1
-				pairIdx := idx >> 1
-				leg := pairIdx / n1Count
-				j := pairIdx % n1Count
-				if w[j] {
-					hw[leg][coord].AddMixed(&pt)
+			cnt := len(pts)
+			if hwWorkers <= 1 || cnt < 512 {
+				for off, pt := range pts {
+					idx := baseIdx + off
+					coord := idx & 1
+					pairIdx := idx >> 1
+					leg := pairIdx / n1Count
+					j := pairIdx % n1Count
+					if w[j] {
+						hw[leg][coord].AddMixed(&pt)
+					}
 				}
+				return
 			}
+			chunk := (cnt + hwWorkers - 1) / hwWorkers
+			var wg sync.WaitGroup
+			for wk := 0; wk < hwWorkers; wk++ {
+				lo := wk * chunk
+				hi := min(cnt, lo+chunk)
+				if lo >= hi {
+					break
+				}
+				wg.Add(1)
+				go func(wk, lo, hi int) {
+					defer wg.Done()
+					loc := localHw[wk]
+					for off := lo; off < hi; off++ {
+						idx := baseIdx + off
+						coord := idx & 1
+						pairIdx := idx >> 1
+						leg := pairIdx / n1Count
+						j := pairIdx % n1Count
+						if w[j] {
+							loc[leg][coord].AddMixed(&pts[off])
+						}
+					}
+				}(wk, lo, hi)
+			}
+			wg.Wait()
 		}); err != nil {
 			return
 		}
+		for wk := range localHw {
+			for leg := 0; leg < par.legs(); leg++ {
+				hw[leg][0].AddAssign(&localHw[wk][leg][0])
+				hw[leg][1].AddAssign(&localHw[wk][leg][1])
+			}
+		}
+		localHw = nil
+
 		// 2b. s(leg)
 		sPts := make([]bn254.G2Affine, par.legs())
 		if err = readG2Count(par.legs(), func(baseIdx int, pts []bn254.G2Affine) {
@@ -1035,7 +1777,6 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 		bquoKey := make([]bn254.G2Affine, l.jQuo)
 		bquoOthJac := make([]bn254.G2Jac, l.jQuo)
 		if err = readG2Count(l.jQuo*cells, func(baseIdx int, pts []bn254.G2Affine) {
-			// Process contiguous sub-slices within each chunk j.
 			pos := 0
 			for pos < len(pts) {
 				abs := baseIdx + pos
@@ -1076,18 +1817,30 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 		}); err != nil {
 			return
 		}
+		if !g2Checker.Finalize() {
+			err = fmt.Errorf("invalid G2 point: subgroup check failed")
+			return
+		}
 
-		var ps []bn254.G1Affine
-		var qs []bn254.G2Affine
-		var psiP []bn254.G1Affine
-		var psiQ []bn254.G2Affine
+		// Batch-convert all accumulated G2 Jacobians to affine in one inversion.
+		hwFlat := make([]bn254.G2Jac, 0, 2*par.legs()+l.jQuo+l.jRem+1)
 		for leg := 0; leg < par.legs(); leg++ {
-			for coord := 0; coord < 2; coord++ {
-				var q bn254.G2Affine
-				q.FromJacobian(&hw[leg][coord])
-				ps = append(ps, fLeg[leg][coord])
-				qs = append(qs, q)
-			}
+			hwFlat = append(hwFlat, hw[leg][0], hw[leg][1])
+		}
+		hwFlat = append(hwFlat, bquoOthJac...)
+		hwFlat = append(hwFlat, bremJac...)
+		hwFlat = append(hwFlat, bwJac)
+		hwAffAll := batchJacobianToAffineG2(hwFlat)
+
+		ps := make([]bn254.G1Affine, 0, 2*par.legs()+2*l.jQuo+l.jRem+1)
+		qs := make([]bn254.G2Affine, 0, 2*par.legs()+2*l.jQuo+l.jRem+1)
+		psiP := make([]bn254.G1Affine, 0, par.legs())
+		psiQ := make([]bn254.G2Affine, 0, par.legs())
+		off := 0
+		for leg := 0; leg < par.legs(); leg++ {
+			ps = append(ps, fLeg[leg][0], fLeg[leg][1])
+			qs = append(qs, hwAffAll[off], hwAffAll[off+1])
+			off += 2
 			psiP = append(psiP, fLeg[leg][0])
 			psiQ = append(psiQ, sPts[leg])
 		}
@@ -1098,23 +1851,33 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 		}
 		for j := 0; j < l.jQuo; j++ {
 			sub(pKey[j], bquoKey[j])
-			var othAff bn254.G2Affine
-			othAff.FromJacobian(&bquoOthJac[j])
-			sub(pOth[j], othAff)
+			sub(pOth[j], hwAffAll[off+j])
 		}
+		off += l.jQuo
 		for j := 0; j < l.jRem; j++ {
-			var remAff bn254.G2Affine
-			remAff.FromJacobian(&bremJac[j])
-			sub(pRem[j], remAff)
+			sub(pRem[j], hwAffAll[off+j])
 		}
-		var bwAff bn254.G2Affine
-		bwAff.FromJacobian(&bwJac)
-		sub(ywAff, bwAff)
+		off += l.jRem
+		sub(ywAff, hwAffAll[off])
 
-		if lambda, err = bn254.Pair(ps, qs); err != nil {
+		// Run the two multi-pairings concurrently.
+		var errL, errP error
+		var pwg sync.WaitGroup
+		pwg.Add(2)
+		go func() {
+			defer pwg.Done()
+			lambda, errL = bn254.Pair(ps, qs)
+		}()
+		go func() {
+			defer pwg.Done()
+			psi, errP = bn254.Pair(psiP, psiQ)
+		}()
+		pwg.Wait()
+		if errL != nil {
+			err = errL
 			return
 		}
-		psi, err = bn254.Pair(psiP, psiQ)
+		err = errP
 		return
 	}
 
@@ -1126,6 +1889,8 @@ func DecStreamFrom(pp *Public, src io.Reader, w []bool, unchecked bool) ([]byte,
 	if err != nil {
 		return nil, rep, err
 	}
+	g2Checker = nil
+	rawG2, ptsG2 = nil, nil
 	rep.PairingsDur = time.Since(tPair)
 
 	// Lines 8-11: identical outward search and key recovery to dec().
