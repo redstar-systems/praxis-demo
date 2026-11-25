@@ -11,7 +11,9 @@ Witness encryption encrypts a message directly to a mathematical statement $S$�
 
 ---
 
-## Interactive Demo & VHS Tape
+## Interactive Demos & VHS Tapes
+
+### 1. Parameter Spectrum Workbench (`docs/demo.gif`)
 
 ![Interactive Praxis TUI Workbench](docs/demo.gif)
 
@@ -102,6 +104,78 @@ Sleep 2s
 Type "x"
 Wait+Screen@15s /still UNSPENT on Signet/
 Sleep 2.2s
+Type "d"
+Wait+Screen@60s /SWEPT ON SIGNET:/
+Sleep 3.2s
+
+Type "q"
+Sleep 600ms
+
+Hide
+Type@0ms "rm -rf $PRAXIS_BIN"
+Enter
+```
+
+</details>
+
+### 2. `praxis-lean` $\mathbb{F}_q$ Conformance & Two-Leaf `2-of-2 + CSV(6)` Signet Vault (`docs/conformance-signet.gif`)
+
+![praxis-lean Conformance and Two-Leaf Signet Vault](docs/conformance-signet.gif)
+
+Recorded from [`docs/conformance-signet.tape`](docs/conformance-signet.tape) (`vhs docs/conformance-signet.tape`), this walkthrough runs:
+
+1. **Automated `psivesely/praxis-lean` Conformance (`go test -count=1 -v -run 'TestLean|TestSignClassKDF' ./praxis`):** Verifies `Praxis/Constants.lean` (including the 77-digit $\beta = 5^{(q-1)/4608} \bmod q$ and `Published.lean` counts), `Forms.lean`, `Kummer.lean`, `Grid.lean`, `Enc.lean`, `Dec.lean` (`expGroups`), and `Keys.lean` (`SignClassKDF` unitary conjugation invariance).
+2. **CLI Two-Leaf Signet Audit (`praxis bridge --admissible`):** Funds `tr(NUMS, {multi_a(2, Dep, Clm), pk(Dep_refund)+CSV(6)})` on Private Signet with `(P1)` & wide-MSIS padding enabled, verifies live on Bitcoin Core that Depositor Leaf-1 rug-pull, Claimer Leaf-1 early spend, and Depositor Leaf-2 premature CSV refund (`non-BIP68-final`) are all blocked, rejects a forged burn proof, and settles the 2-of-2 co-signed withdrawal.
+3. **Interactive TUI Two-Leaf Vault (`praxis tui` Tab 4):** Shows the live SilkCircuit `Guards: BOTH KEYS LIVE · Dep=false · Clm=false · CSV(6)=non-BIP68-final` status bar, forged-witness rejection, and on-chain Signet sweep.
+
+<details>
+<summary>View <code>docs/conformance-signet.tape</code></summary>
+
+```tape
+Output docs/conformance-signet.gif
+
+Set Shell "bash"
+Set FontSize 16
+Set Width 1520
+Set Height 940
+Set Padding 20
+Set Framerate 24
+Set TypingSpeed 32ms
+Set Theme {"background":"#12101a","foreground":"#f8f8f2","cursor":"#e135ff"}
+
+Hide
+Type@0ms "export PRAXIS_BIN=$(mktemp -d) && go build -o $PRAXIS_BIN/praxis ./cmd/praxis && go test -run=^$ ./praxis >/dev/null && export PATH=$PRAXIS_BIN:$PATH && export PS1='$ ' && clear"
+Enter
+Sleep 4s
+Show
+
+# 1. Verify symbol-for-symbol F_q exponent & constant conformance against psivesely/praxis-lean.
+Type "go test -count=1 -v -run 'TestLean|TestSignClassKDF' ./praxis"
+Enter
+Wait+Screen@15s /praxis-demo\/praxis/
+Sleep 2.6s
+
+# 2. Run the CLI two-leaf (2-of-2 + OP_CSV) Bitcoin Private Signet vault audit with (P1)/MSIS padding.
+Type "praxis bridge --admissible"
+Enter
+Wait+Screen@60s /Final Balances:/
+Sleep 3.2s
+
+# 3. Open the SilkCircuit TUI on Tab 4 to inspect the live two-leaf Tapscript & CSV(6) mempool guard.
+Type "praxis tui"
+Enter
+Wait+Screen@10s /PARAMETER SPECTRUM/
+Sleep 800ms
+Type "4"
+Sleep 900ms
+Type "p"
+Sleep 800ms
+Type "e"
+Wait+Screen@60s /non-BIP68-final/
+Sleep 2.2s
+Type "x"
+Wait+Screen@15s /still UNSPENT on Signet/
+Sleep 2s
 Type "d"
 Wait+Screen@60s /SWEPT ON SIGNET:/
 Sleep 3.2s
@@ -273,4 +347,5 @@ What the test suite checks across all seven packages:
 | [`cmd/praxis/`](cmd/praxis/) | CLI entrypoint (`tui`, `bridge`, `demo`, `encrypt`, `decrypt`) |
 | [`curve/`](curve/) | Sanity checks on BN254 generators, bilinearity, and 254-bit prime order |
 | [`docs/LEAN-CONFORMANCE.md`](docs/LEAN-CONFORMANCE.md), [`praxis/lean_conformance_test.go`](praxis/lean_conformance_test.go) | Symbol-for-symbol mapping and automated $\mathbb{F}_q$ exponent conformance tests against [`psivesely/praxis-lean`](https://github.com/psivesely/praxis-lean) |
-| [`docs/demo.tape`](docs/demo.tape), [`docs/demo.gif`](docs/demo.gif) | VHS script and recorded GIF of the interactive workbench |
+| [`docs/demo.tape`](docs/demo.tape), [`docs/demo.gif`](docs/demo.gif) | VHS script and recorded GIF of the 6-tier spectrum slider & sweep workbench |
+| [`docs/conformance-signet.tape`](docs/conformance-signet.tape), [`docs/conformance-signet.gif`](docs/conformance-signet.gif) | VHS script and recorded GIF of the `praxis-lean` conformance suite & two-leaf `2-of-2 + CSV(6)` Signet vault |
